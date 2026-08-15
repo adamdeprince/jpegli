@@ -174,6 +174,8 @@ set(JPEGLI_ENABLE_WASM_THREADS true CACHE BOOL
     "Builds WASM modules with threads support.")
 set(JPEGLI_ENABLE_LTO false CACHE BOOL
     "Set flags to enable LTO.")
+set(JPEGLI_ENABLE_AMD_VULKAN false CACHE BOOL
+    "Enable the direct AMD Vulkan progressive JPEG tokenizer.")
 
 # HWY codegen levers
 foreach(tgt IN LISTS JPEGLI_HWY_TARGETS)

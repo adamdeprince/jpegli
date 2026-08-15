@@ -6,6 +6,39 @@
 
 include(jpegli_lists.cmake)
 
+if(JPEGLI_ENABLE_AMD_VULKAN)
+  find_package(Vulkan 1.3 REQUIRED)
+  find_program(JPEGLI_GLSLC glslc REQUIRED)
+  set(JPEGLI_AMD_VULKAN_GENERATED_DIR
+      "${CMAKE_CURRENT_BINARY_DIR}/generated/jpegli")
+  file(MAKE_DIRECTORY "${JPEGLI_AMD_VULKAN_GENERATED_DIR}")
+  set(JPEGLI_AMD_VULKAN_SPV
+      "${JPEGLI_AMD_VULKAN_GENERATED_DIR}/amd_vulkan_progressive.spv")
+  set(JPEGLI_AMD_VULKAN_SPV_HEADER
+      "${JPEGLI_AMD_VULKAN_GENERATED_DIR}/amd_vulkan_progressive_spv.h")
+  add_custom_command(
+    OUTPUT "${JPEGLI_AMD_VULKAN_SPV_HEADER}"
+    COMMAND "${JPEGLI_GLSLC}" --target-env=vulkan1.3 -O
+            "${CMAKE_CURRENT_SOURCE_DIR}/jpegli/amd_vulkan_progressive.comp"
+            -o "${JPEGLI_AMD_VULKAN_SPV}"
+    COMMAND "${CMAKE_COMMAND}"
+            "-DINPUT=${JPEGLI_AMD_VULKAN_SPV}"
+            "-DOUTPUT=${JPEGLI_AMD_VULKAN_SPV_HEADER}"
+            -DSYMBOL=kAmdVulkanProgressiveSpv
+            -P "${PROJECT_SOURCE_DIR}/cmake/EmbedBinary.cmake"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/jpegli/amd_vulkan_progressive.comp"
+      "${PROJECT_SOURCE_DIR}/cmake/EmbedBinary.cmake"
+    VERBATIM)
+  set_source_files_properties("${JPEGLI_AMD_VULKAN_SPV_HEADER}"
+                              PROPERTIES GENERATED TRUE)
+  list(APPEND JPEGLI_INTERNAL_JPEGLI_SOURCES
+    jpegli/amd_vulkan_progressive.cc
+    jpegli/amd_vulkan_progressive.h
+    "${JPEGLI_AMD_VULKAN_SPV_HEADER}"
+  )
+endif()
+
 set(JPEGLI_INTERNAL_LIBS
   hwy
   Threads::Threads
@@ -39,6 +72,15 @@ target_include_directories(jpegli-static PRIVATE
   "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>"
   "${JPEGLI_HWY_INCLUDE_DIRS}"
 )
+if(JPEGLI_ENABLE_AMD_VULKAN)
+  target_include_directories(jpegli-static PRIVATE
+    "${JPEGLI_AMD_VULKAN_GENERATED_DIR}"
+  )
+  target_compile_definitions(jpegli-static PRIVATE
+    JPEGLI_ENABLE_AMD_VULKAN=1
+  )
+  target_link_libraries(jpegli-static PRIVATE Vulkan::Vulkan)
+endif()
 target_include_directories(jpegli-static PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include/jpegli>"
 )

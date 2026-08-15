@@ -7,8 +7,11 @@
 #include "lib/jpegli/entropy_coding.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -16,6 +19,7 @@
 #include "lib/base/bits.h"
 #include "lib/base/status.h"
 #include "lib/base/types.h"
+#include "lib/jpegli/amd_vulkan_progressive.h"
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/encode_internal.h"
@@ -92,8 +96,104 @@ void TokenizeProgressiveDC(const coeff_t* coeffs, int context, int Al,
   *(*next_token)++ = Token(context, nbits, bits);
 }
 
+bool TokenizeACProgressiveScanAmdVulkan(j_compress_ptr cinfo, int scan_index,
+                                        int context, ScanTokenInfo* sti) {
+  AmdVulkanACResult gpu;
+  if (!AmdVulkanTokenizeInitialAC(cinfo, scan_index, context, &gpu)) {
+    return false;
+  }
+  const auto stitch_start = std::chrono::steady_clock::now();
+
+  jpeg_comp_master* m = cinfo->master;
+  const jpeg_scan_info* scan_info = &cinfo->scan_info[scan_index];
+  const int comp_idx = scan_info->component_index[0];
+  const jpeg_component_info* comp = &cinfo->comp_info[comp_idx];
+  const int Ss = scan_info->Ss;
+  const int Se = scan_info->Se;
+  const size_t restart_interval = sti->restart_interval;
+  int restarts_to_go = restart_interval;
+  size_t num_restarts =
+      restart_interval > 0 ? DivCeil(gpu.num_blocks, restart_interval) : 1;
+  size_t restart_idx = 0;
+  size_t block_idx = 0;
+  int eob_run = 0;
+  TokenArray* ta = &m->token_arrays[m->cur_token_array];
+  sti->token_offset = m->total_num_tokens + ta->num_tokens;
+  sti->restarts = Allocate<size_t>(cinfo, num_restarts, JPOOL_IMAGE);
+  const auto emit_eob_run = [&]() {
+    int nbits = jpegli::FloorLog2Nonzero<uint32_t>(eob_run);
+    int symbol = nbits << 4u;
+    *m->next_token++ = Token(context, symbol, eob_run & ((1 << nbits) - 1));
+    eob_run = 0;
+  };
+
+  for (JDIMENSION by = 0; by < comp->height_in_blocks; ++by) {
+    int max_tokens_per_row = 1 + comp->width_in_blocks * (Se - Ss + 1);
+    if (ta->num_tokens + max_tokens_per_row > m->num_tokens) {
+      if (ta->tokens) {
+        m->total_num_tokens += ta->num_tokens;
+        ++m->cur_token_array;
+        ta = &m->token_arrays[m->cur_token_array];
+      }
+      m->num_tokens =
+          EstimateNumTokens(cinfo, by, comp->height_in_blocks,
+                            m->total_num_tokens, max_tokens_per_row);
+      ta->tokens = Allocate<Token>(cinfo, m->num_tokens, JPOOL_IMAGE);
+      m->next_token = ta->tokens;
+    }
+    for (JDIMENSION bx = 0; bx < comp->width_in_blocks; ++bx, ++block_idx) {
+      if (restart_interval > 0 && restarts_to_go == 0) {
+        if (eob_run > 0) emit_eob_run();
+        ta->num_tokens = m->next_token - ta->tokens;
+        sti->restarts[restart_idx++] = m->total_num_tokens + ta->num_tokens;
+        restarts_to_go = restart_interval;
+      }
+      const uint32_t* descriptor = gpu.words + block_idx * gpu.stride_words;
+      const uint32_t num_tokens = descriptor[0];
+      const uint32_t metadata = descriptor[1];
+      JPEGLI_DASSERT(num_tokens <= static_cast<uint32_t>(Se - Ss + 1));
+      if (num_tokens > 0 && eob_run > 0) emit_eob_run();
+      for (uint32_t i = 0; i < num_tokens; ++i) {
+        const uint32_t packed = descriptor[2 + i];
+        *m->next_token++ =
+            Token(packed & 0xffu, (packed >> 8u) & 0xffu, packed >> 16u);
+      }
+      if ((metadata & (1u << 16u)) != 0) {
+        ++eob_run;
+        if (eob_run == 0x7fff) emit_eob_run();
+      }
+      sti->num_nonzeros += metadata & 0xffu;
+      sti->num_future_nonzeros += (metadata >> 8u) & 0xffu;
+      --restarts_to_go;
+    }
+    ta->num_tokens = m->next_token - ta->tokens;
+  }
+  JPEGLI_DASSERT(block_idx == gpu.num_blocks);
+  if (eob_run > 0) {
+    emit_eob_run();
+    ++ta->num_tokens;
+  }
+  sti->num_tokens = m->total_num_tokens + ta->num_tokens - sti->token_offset;
+  sti->restarts[restart_idx++] = m->total_num_tokens + ta->num_tokens;
+  JPEGLI_DASSERT(restart_idx == num_restarts);
+  const char* trace = std::getenv("JPEGLI_AMD_VULKAN_TRACE");
+  if (trace != nullptr && strcmp(trace, "0") != 0) {
+    const double milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - stitch_start)
+            .count();
+    fprintf(stderr,
+            "jpegli amd-vulkan: stitched initial AC scan %d in %.3f ms\n",
+            scan_index, milliseconds);
+  }
+  return true;
+}
+
 void TokenizeACProgressiveScan(j_compress_ptr cinfo, int scan_index,
                                int context, ScanTokenInfo* sti) {
+  if (TokenizeACProgressiveScanAmdVulkan(cinfo, scan_index, context, sti)) {
+    return;
+  }
   jpeg_comp_master* m = cinfo->master;
   const jpeg_scan_info* scan_info = &cinfo->scan_info[scan_index];
   const int comp_idx = scan_info->component_index[0];
@@ -199,8 +299,134 @@ void TokenizeACProgressiveScan(j_compress_ptr cinfo, int scan_index,
   sti->restarts[restart_idx++] = m->total_num_tokens + ta->num_tokens;
 }
 
+bool TokenizeACRefinementScanAmdVulkan(j_compress_ptr cinfo, int scan_index,
+                                       ScanTokenInfo* sti) {
+  AmdVulkanACResult gpu;
+  if (!AmdVulkanTokenizeRefinementAC(cinfo, scan_index, &gpu)) {
+    return false;
+  }
+  const auto stitch_start = std::chrono::steady_clock::now();
+
+  jpeg_comp_master* m = cinfo->master;
+  const jpeg_scan_info* scan_info = &cinfo->scan_info[scan_index];
+  const int Ss = scan_info->Ss;
+  const int Se = scan_info->Se;
+  const size_t restart_interval = sti->restart_interval;
+  int restarts_to_go = restart_interval;
+  size_t num_restarts =
+      restart_interval > 0 ? DivCeil(gpu.num_blocks, restart_interval) : 1;
+  sti->tokens = m->next_refinement_token;
+  sti->refbits = m->next_refinement_bit;
+  sti->eobruns = Allocate<uint16_t>(cinfo, gpu.num_blocks / 2, JPOOL_IMAGE);
+  sti->restarts = Allocate<size_t>(cinfo, num_restarts, JPOOL_IMAGE);
+  RefToken* next_token = sti->tokens;
+  RefToken* next_eob_token = next_token;
+  uint8_t* next_ref_bit = sti->refbits;
+  uint16_t* next_eobrun = sti->eobruns;
+  size_t restart_idx = 0;
+  int eob_run = 0;
+  int eob_refbits = 0;
+
+  for (size_t block_idx = 0; block_idx < gpu.num_blocks; ++block_idx) {
+    if (restart_interval > 0 && restarts_to_go == 0) {
+      sti->restarts[restart_idx++] = next_token - sti->tokens;
+      restarts_to_go = restart_interval;
+      next_eob_token = next_token;
+      eob_run = eob_refbits = 0;
+    }
+    const uint32_t* descriptor = gpu.words + block_idx * gpu.stride_words;
+    const uint32_t num_events = descriptor[0];
+    JPEGLI_DASSERT(num_events <= static_cast<uint32_t>(Se - Ss + 1));
+    RefToken token;
+    int num_eob_refinement_bits = 0;
+    int num_refinement_bits = 0;
+    int num_nzeros = 0;
+    int r = 0;
+    int previous_position = Ss - 1;
+    for (uint32_t event_idx = 0; event_idx < num_events; ++event_idx) {
+      const uint32_t event = descriptor[2 + event_idx];
+      const int position = event & 0xffu;
+      JPEGLI_DASSERT(position > previous_position && position <= Se);
+      r += position - previous_position - 1;
+      previous_position = position;
+      while (r > 15) {
+        token.symbol = 0xf0;
+        token.refbits = num_refinement_bits;
+        *next_token++ = token;
+        r -= 16;
+        num_eob_refinement_bits += num_refinement_bits;
+        num_refinement_bits = 0;
+      }
+      const bool existing_nonzero = (event & (1u << 8u)) != 0;
+      if (existing_nonzero) {
+        *next_ref_bit++ = (event >> 9u) & 1u;
+        ++num_refinement_bits;
+        continue;
+      }
+      const int positive = (event >> 10u) & 1u;
+      token.symbol = (r << 4u) + 1 + (positive << 1u);
+      token.refbits = num_refinement_bits;
+      *next_token++ = token;
+      ++num_nzeros;
+      num_refinement_bits = 0;
+      num_eob_refinement_bits = 0;
+      r = 0;
+      next_eob_token = next_token;
+      eob_run = eob_refbits = 0;
+    }
+    r += Se - previous_position;
+    if (r > 0 || num_eob_refinement_bits + num_refinement_bits > 0) {
+      ++eob_run;
+      eob_refbits += num_eob_refinement_bits + num_refinement_bits;
+      if (eob_refbits > 255) {
+        ++next_eob_token;
+        eob_refbits = num_eob_refinement_bits + num_refinement_bits;
+        eob_run = 1;
+      }
+      next_token = next_eob_token;
+      next_token->refbits = eob_refbits;
+      if (eob_run == 1) {
+        next_token->symbol = 0;
+      } else if (eob_run == 2) {
+        next_token->symbol = 16;
+        *next_eobrun++ = 0;
+      } else if ((eob_run & (eob_run - 1)) == 0) {
+        next_token->symbol += 16;
+        next_eobrun[-1] = 0;
+      } else {
+        ++next_eobrun[-1];
+      }
+      ++next_token;
+      if (eob_run == 0x7fff) {
+        next_eob_token = next_token;
+        eob_run = eob_refbits = 0;
+      }
+    }
+    sti->num_nonzeros += num_nzeros;
+    --restarts_to_go;
+  }
+  sti->num_tokens = next_token - sti->tokens;
+  sti->restarts[restart_idx++] = sti->num_tokens;
+  JPEGLI_DASSERT(restart_idx == num_restarts);
+  m->next_refinement_token = next_token;
+  m->next_refinement_bit = next_ref_bit;
+
+  const char* trace = std::getenv("JPEGLI_AMD_VULKAN_TRACE");
+  if (trace != nullptr && strcmp(trace, "0") != 0) {
+    const double milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - stitch_start)
+            .count();
+    fprintf(stderr,
+            "jpegli amd-vulkan: stitched refinement AC scan %d in %.3f ms\n",
+            scan_index, milliseconds);
+  }
+  return true;
+}
+
 void TokenizeACRefinementScan(j_compress_ptr cinfo, int scan_index,
                               ScanTokenInfo* sti) {
+  if (TokenizeACRefinementScanAmdVulkan(cinfo, scan_index, sti)) return;
   jpeg_comp_master* m = cinfo->master;
   const jpeg_scan_info* scan_info = &cinfo->scan_info[scan_index];
   const int comp_idx = scan_info->component_index[0];
@@ -452,6 +678,8 @@ void TokenizeScan(j_compress_ptr cinfo, size_t scan_index, int ac_ctx_offset,
 
 void TokenizeJpeg(j_compress_ptr cinfo) {
   jpeg_comp_master* m = cinfo->master;
+  const bool amd_vulkan_active =
+      cinfo->progressive_mode && AmdVulkanProgressiveBegin(cinfo);
   std::vector<int> processed(cinfo->num_scans);
   size_t max_refinement_tokens = 0;
   size_t num_refinement_bits = 0;
@@ -513,6 +741,7 @@ void TokenizeJpeg(j_compress_ptr cinfo) {
     TokenizeScan(cinfo, i, offset, &m->scan_token_info[i]);
     processed[i] = 1;
   }
+  if (amd_vulkan_active) AmdVulkanProgressiveEnd(cinfo);
 }
 
 namespace {
