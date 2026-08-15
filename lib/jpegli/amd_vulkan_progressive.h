@@ -25,9 +25,15 @@ struct AmdVulkanACResult {
 
 #if defined(JPEGLI_ENABLE_AMD_VULKAN)
 
+// Copies the completed quantized coefficient planes into one of two retained
+// UMA slots and submits all supported progressive AC scans without waiting.
+// The compressor must be finished or aborted on the same thread.
+bool AmdVulkanProgressiveSubmit(j_compress_ptr cinfo);
+
 // Uploads the coefficient planes once for all progressive scans in an image.
-// The Vulkan device, queue, pipeline, command buffer, fence and mapped buffers
-// are retained per encoder thread across images.
+// If the image was submitted earlier this waits for its slot; otherwise this
+// performs a synchronous submit-and-wait for compatibility with the existing
+// encoder entry point.
 bool AmdVulkanProgressiveBegin(j_compress_ptr cinfo);
 void AmdVulkanProgressiveEnd(j_compress_ptr cinfo);
 
@@ -46,6 +52,7 @@ bool AmdVulkanTokenizeRefinementAC(j_compress_ptr cinfo, int scan_index,
 
 #else
 
+inline bool AmdVulkanProgressiveSubmit(j_compress_ptr) { return false; }
 inline bool AmdVulkanProgressiveBegin(j_compress_ptr) { return false; }
 inline void AmdVulkanProgressiveEnd(j_compress_ptr) {}
 inline bool AmdVulkanTokenizeInitialAC(j_compress_ptr, int, int,

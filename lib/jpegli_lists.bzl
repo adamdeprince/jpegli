@@ -157,6 +157,8 @@ libjpegli_jpegli_libjpeg_helper_files = [
 libjpegli_jpegli_sources = [
     "jpegli/adaptive_quantization.cc",
     "jpegli/adaptive_quantization.h",
+    "jpegli/amd_vulkan_progressive.cc",
+    "jpegli/amd_vulkan_progressive.h",
     "jpegli/bit_writer.cc",
     "jpegli/bit_writer.h",
     "jpegli/bitstream.cc",
@@ -199,6 +201,8 @@ libjpegli_jpegli_sources = [
     "jpegli/input.h",
     "jpegli/memory_manager.cc",
     "jpegli/memory_manager.h",
+    "jpegli/pipeline.h",
+    "jpegli/pipeline_internal.h",
     "jpegli/quant.cc",
     "jpegli/quant.h",
     "jpegli/render.cc",

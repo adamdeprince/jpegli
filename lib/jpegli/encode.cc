@@ -14,6 +14,7 @@
 
 #include "lib/base/types.h"
 #include "lib/jpegli/adaptive_quantization.h"
+#include "lib/jpegli/amd_vulkan_progressive.h"
 #include "lib/jpegli/bit_writer.h"
 #include "lib/jpegli/bitstream.h"
 #include "lib/jpegli/color_transform.h"
@@ -28,6 +29,7 @@
 #include "lib/jpegli/huffman.h"
 #include "lib/jpegli/input.h"
 #include "lib/jpegli/memory_manager.h"
+#include "lib/jpegli/pipeline_internal.h"
 #include "lib/jpegli/quant.h"
 #include "lib/jpegli/simd.h"
 #include "lib/jpegli/types.h"
@@ -1224,6 +1226,16 @@ JDIMENSION jpegli_write_raw_data(j_compress_ptr cinfo, JSAMPIMAGE data,
 //
 // Non-streaming part
 //
+
+boolean jpegli::PipelineSubmit(j_compress_ptr cinfo) {
+  if (cinfo == nullptr || cinfo->global_state != jpegli::kEncReadImage ||
+      cinfo->master == nullptr || cinfo->master->coeff_buffers == nullptr ||
+      cinfo->next_scanline < cinfo->image_height || !cinfo->progressive_mode ||
+      cinfo->master->psnr_target > 0) {
+    return FALSE;
+  }
+  return jpegli::AmdVulkanProgressiveSubmit(cinfo) ? TRUE : FALSE;
+}
 
 void jpegli_finish_compress(j_compress_ptr cinfo) {
   CheckState(cinfo, jpegli::kEncReadImage, jpegli::kEncWriteCoeffs);

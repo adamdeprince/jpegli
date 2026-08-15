@@ -32,6 +32,7 @@ constexpr uint32_t kAmdVendorId = 0x1002;
 constexpr uint32_t kWaveSize = 64;
 constexpr size_t kCoefficientWordsPerBlock = DCTSIZE2 / 2;
 constexpr size_t kAutoMinComponentBlocks = 4096;
+constexpr size_t kPipelineSlots = 2;
 
 bool EnvironmentDisablesGpu() {
   const char* value = std::getenv("JPEGLI_AMD_VULKAN_PROGRESSIVE");
@@ -81,12 +82,32 @@ struct PushConstants {
 };
 static_assert(sizeof(PushConstants) == 40, "shader push-constant ABI changed");
 
+struct PipelineSlot {
+  j_compress_ptr cinfo = nullptr;
+  MappedBuffer coefficient_buffer;
+  MappedBuffer descriptor_buffer;
+  VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  VkQueryPool query_pool = VK_NULL_HANDLE;
+  bool descriptors_dirty = true;
+  bool in_flight = false;
+  bool ready = false;
+  std::array<size_t, kMaxComponents> component_word_offsets = {};
+  std::array<size_t, kMaxComponents> component_num_blocks = {};
+  std::vector<AmdVulkanACResult> cached_results;
+  std::chrono::steady_clock::time_point submit_time;
+};
+
 class AmdVulkanProgressiveTokenizer {
  public:
   ~AmdVulkanProgressiveTokenizer() { Shutdown(); }
 
-  bool BeginImage(j_compress_ptr cinfo) {
-    active_cinfo_ = nullptr;
+  bool SubmitImage(j_compress_ptr cinfo) {
+    if (cinfo == nullptr || !cinfo->progressive_mode ||
+        cinfo->master == nullptr)
+      return false;
+    if (FindSlot(cinfo) != nullptr) return true;
     if (EnvironmentDisablesGpu()) return false;
     size_t image_blocks = 0;
     for (int c = 0; c < cinfo->num_components; ++c) {
@@ -99,9 +120,14 @@ class AmdVulkanProgressiveTokenizer {
       return false;
     }
     if (!Initialize()) return false;
+    PipelineSlot* slot = FindFreeSlot();
+    if (slot == nullptr) {
+      Trace("both pipeline slots are occupied; using CPU tokenizer");
+      return false;
+    }
     const auto upload_start = std::chrono::steady_clock::now();
     if (cinfo->num_components >
-        static_cast<int>(component_word_offsets_.size())) {
+        static_cast<int>(slot->component_word_offsets.size())) {
       return false;
     }
 
@@ -114,23 +140,24 @@ class AmdVulkanProgressiveTokenizer {
                            kCoefficientWordsPerBlock) {
         return false;
       }
-      component_word_offsets_[c] = total_words;
-      component_num_blocks_[c] = num_blocks;
+      slot->component_word_offsets[c] = total_words;
+      slot->component_num_blocks[c] = num_blocks;
       total_words += num_blocks * kCoefficientWordsPerBlock;
     }
     if (total_words > std::numeric_limits<uint32_t>::max()) return false;
-    if (!EnsureBuffer(&coefficient_buffer_, total_words * sizeof(uint32_t))) {
+    if (!EnsureBuffer(slot, &slot->coefficient_buffer,
+                      total_words * sizeof(uint32_t))) {
       return false;
     }
 
     static_assert(sizeof(coeff_t) == sizeof(JCOEF),
                   "GPU coefficient ABI must match JBLOCK storage");
-    auto* destination = static_cast<uint8_t*>(coefficient_buffer_.mapped);
+    auto* destination = static_cast<uint8_t*>(slot->coefficient_buffer.mapped);
     jpeg_comp_master* master = cinfo->master;
     for (int c = 0; c < cinfo->num_components; ++c) {
       const jpeg_component_info& comp = cinfo->comp_info[c];
       uint8_t* component_destination =
-          destination + component_word_offsets_[c] * sizeof(uint32_t);
+          destination + slot->component_word_offsets[c] * sizeof(uint32_t);
       const size_t row_bytes =
           static_cast<size_t>(comp.width_in_blocks) * DCTSIZE2 * sizeof(JCOEF);
       for (JDIMENSION by = 0; by < comp.height_in_blocks; ++by) {
@@ -141,7 +168,8 @@ class AmdVulkanProgressiveTokenizer {
                &blocks[0][0][0], row_bytes);
       }
     }
-    active_cinfo_ = cinfo;
+    slot->cinfo = cinfo;
+    slot->ready = false;
     if (TraceEnabled()) {
       const double milliseconds =
           std::chrono::duration<double, std::milli>(
@@ -151,20 +179,41 @@ class AmdVulkanProgressiveTokenizer {
               "jpegli amd-vulkan: uploaded %zu coefficient words in %.3f ms\n",
               total_words, milliseconds);
     }
-    if (!DispatchAllACScans(cinfo)) {
+    if (!DispatchAllACScans(cinfo, slot)) {
       // A failure can occur after the fence has been reset. Disable this
-      // thread's backend so a later image cannot wait on an unsignaled fence;
-      // the encoder transparently recomputes this image on the CPU.
+      // thread's backend so a later image cannot reuse an unsignaled fence.
+      // The encoder transparently recomputes this image on the CPU.
       Trace("AC batch failed; disabling AMD Vulkan tokenizer for this thread");
       available_ = false;
-      active_cinfo_ = nullptr;
+      ReleaseSlot(slot);
       return false;
     }
     return true;
   }
 
+  bool BeginImage(j_compress_ptr cinfo) {
+    active_slot_ = nullptr;
+    PipelineSlot* slot = FindSlot(cinfo);
+    if (slot == nullptr) {
+      if (!SubmitImage(cinfo)) return false;
+      slot = FindSlot(cinfo);
+    }
+    if (slot == nullptr) return false;
+    if (!WaitForSlot(slot)) {
+      available_ = false;
+      ReleaseSlot(slot);
+      return false;
+    }
+    active_slot_ = slot;
+    return true;
+  }
+
   void EndImage(j_compress_ptr cinfo) {
-    if (active_cinfo_ == cinfo) active_cinfo_ = nullptr;
+    PipelineSlot* slot = FindSlot(cinfo);
+    if (slot == nullptr) return;
+    if (slot->in_flight && !WaitForSlot(slot)) available_ = false;
+    if (active_slot_ == slot) active_slot_ = nullptr;
+    ReleaseSlot(slot);
   }
 
   bool TokenizeInitialAC(j_compress_ptr cinfo, int scan_index, int context,
@@ -179,7 +228,10 @@ class AmdVulkanProgressiveTokenizer {
 
   bool TokenizeAC(j_compress_ptr cinfo, int scan_index, int context,
                   uint32_t mode, AmdVulkanACResult* result) {
-    if (active_cinfo_ != cinfo || result == nullptr) return false;
+    if (active_slot_ == nullptr || active_slot_->cinfo != cinfo ||
+        !active_slot_->ready || result == nullptr) {
+      return false;
+    }
     const jpeg_scan_info& scan = cinfo->scan_info[scan_index];
     if (scan.comps_in_scan != 1 || scan.Ss <= 0 ||
         (mode == 0 && scan.Ah != 0) || (mode == 1 && scan.Ah == 0) ||
@@ -188,110 +240,15 @@ class AmdVulkanProgressiveTokenizer {
       return false;
     }
     if (scan_index >= 0 &&
-        scan_index < static_cast<int>(cached_results_.size()) &&
-        cached_results_[scan_index].words != nullptr) {
-      *result = cached_results_[scan_index];
+        scan_index < static_cast<int>(active_slot_->cached_results.size()) &&
+        active_slot_->cached_results[scan_index].words != nullptr) {
+      *result = active_slot_->cached_results[scan_index];
       return true;
     }
-
-    const int component = scan.component_index[0];
-    const size_t num_blocks = component_num_blocks_[component];
-    if (num_blocks == 0) return false;
-    const size_t stride_words = 2 + scan.Se - scan.Ss + 1;
-    if (num_blocks > std::numeric_limits<uint32_t>::max() ||
-        stride_words > std::numeric_limits<uint32_t>::max() ||
-        num_blocks > std::numeric_limits<size_t>::max() / stride_words) {
-      return false;
-    }
-    const size_t output_words = num_blocks * stride_words;
-    if (!EnsureBuffer(&descriptor_buffer_, output_words * sizeof(uint32_t)) ||
-        !UpdateDescriptors()) {
-      return false;
-    }
-
-    const VkPhysicalDeviceLimits& limits = properties_.limits;
-    const uint32_t dispatch_width = static_cast<uint32_t>(
-        std::min<size_t>(num_blocks, limits.maxComputeWorkGroupCount[0]));
-    const uint32_t dispatch_height = static_cast<uint32_t>(
-        (num_blocks + dispatch_width - 1) / dispatch_width);
-    if (dispatch_height > limits.maxComputeWorkGroupCount[1]) return false;
-
-    PushConstants push = {
-        static_cast<uint32_t>(component_word_offsets_[component]),
-        static_cast<uint32_t>(num_blocks),
-        static_cast<uint32_t>(scan.Ss),
-        static_cast<uint32_t>(scan.Se),
-        static_cast<uint32_t>(scan.Al),
-        static_cast<uint32_t>(stride_words),
-        static_cast<uint32_t>(context),
-        dispatch_width,
-        mode,
-        0,
-    };
-
-    const auto start = std::chrono::steady_clock::now();
-    if (vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX) !=
-            VK_SUCCESS ||
-        vkResetFences(device_, 1, &fence_) != VK_SUCCESS ||
-        vkResetCommandBuffer(command_buffer_, 0) != VK_SUCCESS) {
-      return false;
-    }
-
-    VkCommandBufferBeginInfo begin_info = {};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(command_buffer_, &begin_info) != VK_SUCCESS) {
-      return false;
-    }
-    VkMemoryBarrier host_to_compute = {};
-    host_to_compute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    host_to_compute.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-    host_to_compute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_HOST_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                         &host_to_compute, 0, nullptr, 0, nullptr);
-    vkCmdBindPipeline(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      pipeline_);
-    vkCmdBindDescriptorSets(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline_layout_, 0, 1, &descriptor_set_, 0,
-                            nullptr);
-    vkCmdPushConstants(command_buffer_, pipeline_layout_,
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(command_buffer_, dispatch_width, dispatch_height, 1);
-    VkMemoryBarrier compute_to_host = {};
-    compute_to_host.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    compute_to_host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    compute_to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &compute_to_host, 0,
-                         nullptr, 0, nullptr);
-    if (vkEndCommandBuffer(command_buffer_) != VK_SUCCESS) return false;
-
-    VkSubmitInfo submit = {};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &command_buffer_;
-    if (vkQueueSubmit(queue_, 1, &submit, fence_) != VK_SUCCESS ||
-        vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX) !=
-            VK_SUCCESS) {
-      return false;
-    }
-
-    result->words = static_cast<const uint32_t*>(descriptor_buffer_.mapped);
-    result->stride_words = stride_words;
-    result->num_blocks = num_blocks;
-    if (TraceEnabled()) {
-      const double milliseconds = std::chrono::duration<double, std::milli>(
-                                      std::chrono::steady_clock::now() - start)
-                                      .count();
-      fprintf(stderr, "jpegli amd-vulkan: %s AC scan %d, %zu blocks, %.3f ms\n",
-              mode == 0 ? "initial" : "refinement", scan_index, num_blocks,
-              milliseconds);
-    }
-    return true;
+    return false;
   }
 
-  bool DispatchAllACScans(j_compress_ptr cinfo) {
+  bool DispatchAllACScans(j_compress_ptr cinfo, PipelineSlot* slot) {
     struct ScanDispatch {
       int scan_index;
       uint32_t width;
@@ -299,8 +256,9 @@ class AmdVulkanProgressiveTokenizer {
       PushConstants push;
     };
     std::vector<ScanDispatch> dispatches;
-    cached_results_.assign(cinfo->num_scans, {});
+    slot->cached_results.assign(cinfo->num_scans, {});
     size_t total_output_words = 0;
+    size_t total_wave64_workgroups = 0;
     for (int scan_index = 0; scan_index < cinfo->num_scans; ++scan_index) {
       const jpeg_scan_info& scan = cinfo->scan_info[scan_index];
       if (scan.Ss <= 0 || scan.comps_in_scan != 1 || scan.Se < scan.Ss ||
@@ -308,7 +266,7 @@ class AmdVulkanProgressiveTokenizer {
         continue;
       }
       const int component = scan.component_index[0];
-      const size_t num_blocks = component_num_blocks_[component];
+      const size_t num_blocks = slot->component_num_blocks[component];
       const size_t stride_words = 2 + scan.Se - scan.Ss + 1;
       if (num_blocks == 0 ||
           num_blocks > std::numeric_limits<uint32_t>::max() ||
@@ -327,7 +285,7 @@ class AmdVulkanProgressiveTokenizer {
       }
       const uint32_t mode = scan.Ah == 0 ? 0 : 1;
       PushConstants push = {
-          static_cast<uint32_t>(component_word_offsets_[component]),
+          static_cast<uint32_t>(slot->component_word_offsets[component]),
           static_cast<uint32_t>(num_blocks),
           static_cast<uint32_t>(scan.Ss),
           static_cast<uint32_t>(scan.Se),
@@ -339,91 +297,169 @@ class AmdVulkanProgressiveTokenizer {
           static_cast<uint32_t>(total_output_words),
       };
       dispatches.push_back({scan_index, width, height, push});
-      cached_results_[scan_index].stride_words = stride_words;
-      cached_results_[scan_index].num_blocks = num_blocks;
+      slot->cached_results[scan_index].stride_words = stride_words;
+      slot->cached_results[scan_index].num_blocks = num_blocks;
       total_output_words += num_blocks * stride_words;
+      total_wave64_workgroups += num_blocks;
     }
-    if (dispatches.empty()) return true;
-    if (!EnsureBuffer(&descriptor_buffer_,
+    if (dispatches.empty()) {
+      slot->ready = true;
+      return true;
+    }
+    if (!EnsureBuffer(slot, &slot->descriptor_buffer,
                       total_output_words * sizeof(uint32_t)) ||
-        !UpdateDescriptors()) {
-      cached_results_.clear();
+        !UpdateDescriptors(slot)) {
+      slot->cached_results.clear();
       return false;
     }
     const uint32_t* output =
-        static_cast<const uint32_t*>(descriptor_buffer_.mapped);
+        static_cast<const uint32_t*>(slot->descriptor_buffer.mapped);
     for (const ScanDispatch& dispatch : dispatches) {
-      cached_results_[dispatch.scan_index].words =
+      slot->cached_results[dispatch.scan_index].words =
           output + dispatch.push.output_word_offset;
     }
 
-    const auto start = std::chrono::steady_clock::now();
-    if (vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX) !=
+    if (vkWaitForFences(device_, 1, &slot->fence, VK_TRUE, UINT64_MAX) !=
             VK_SUCCESS ||
-        vkResetFences(device_, 1, &fence_) != VK_SUCCESS ||
-        vkResetCommandBuffer(command_buffer_, 0) != VK_SUCCESS) {
-      cached_results_.clear();
+        vkResetFences(device_, 1, &slot->fence) != VK_SUCCESS ||
+        vkResetCommandBuffer(slot->command_buffer, 0) != VK_SUCCESS) {
+      slot->cached_results.clear();
       return false;
     }
     VkCommandBufferBeginInfo begin_info = {};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(command_buffer_, &begin_info) != VK_SUCCESS) {
-      cached_results_.clear();
+    if (vkBeginCommandBuffer(slot->command_buffer, &begin_info) != VK_SUCCESS) {
+      slot->cached_results.clear();
       return false;
+    }
+    if (slot->query_pool != VK_NULL_HANDLE) {
+      vkCmdResetQueryPool(slot->command_buffer, slot->query_pool, 0, 2);
+      vkCmdWriteTimestamp(slot->command_buffer,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot->query_pool,
+                          0);
     }
     VkMemoryBarrier host_to_compute = {};
     host_to_compute.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     host_to_compute.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
     host_to_compute.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_HOST_BIT,
+    vkCmdPipelineBarrier(slot->command_buffer, VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
                          &host_to_compute, 0, nullptr, 0, nullptr);
-    vkCmdBindPipeline(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+    vkCmdBindPipeline(slot->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                       pipeline_);
-    vkCmdBindDescriptorSets(command_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline_layout_, 0, 1, &descriptor_set_, 0,
-                            nullptr);
+    vkCmdBindDescriptorSets(slot->command_buffer,
+                            VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0,
+                            1, &slot->descriptor_set, 0, nullptr);
     for (const ScanDispatch& dispatch : dispatches) {
-      vkCmdPushConstants(command_buffer_, pipeline_layout_,
+      vkCmdPushConstants(slot->command_buffer, pipeline_layout_,
                          VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispatch.push),
                          &dispatch.push);
-      vkCmdDispatch(command_buffer_, dispatch.width, dispatch.height, 1);
+      vkCmdDispatch(slot->command_buffer, dispatch.width, dispatch.height, 1);
     }
     VkMemoryBarrier compute_to_host = {};
     compute_to_host.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     compute_to_host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     compute_to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(slot->command_buffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &compute_to_host, 0,
                          nullptr, 0, nullptr);
-    if (vkEndCommandBuffer(command_buffer_) != VK_SUCCESS) {
-      cached_results_.clear();
+    if (slot->query_pool != VK_NULL_HANDLE) {
+      vkCmdWriteTimestamp(slot->command_buffer,
+                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                          slot->query_pool, 1);
+    }
+    if (vkEndCommandBuffer(slot->command_buffer) != VK_SUCCESS) {
+      slot->cached_results.clear();
       return false;
     }
     VkSubmitInfo submit = {};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &command_buffer_;
-    if (vkQueueSubmit(queue_, 1, &submit, fence_) != VK_SUCCESS ||
-        vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX) !=
-            VK_SUCCESS) {
-      cached_results_.clear();
+    submit.pCommandBuffers = &slot->command_buffer;
+    slot->submit_time = std::chrono::steady_clock::now();
+    if (vkQueueSubmit(queue_, 1, &submit, slot->fence) != VK_SUCCESS) {
+      slot->cached_results.clear();
       return false;
     }
+    slot->in_flight = true;
     if (TraceEnabled()) {
-      const double milliseconds = std::chrono::duration<double, std::milli>(
-                                      std::chrono::steady_clock::now() - start)
-                                      .count();
       fprintf(stderr,
-              "jpegli amd-vulkan: batched %zu AC scans (%zu descriptor words) "
-              "in %.3f ms\n",
-              dispatches.size(), total_output_words, milliseconds);
+              "jpegli amd-vulkan: submitted %zu AC scans, %zu wave64 "
+              "workgroups (%zu descriptor words) asynchronously\n",
+              dispatches.size(), total_wave64_workgroups, total_output_words);
     }
     return true;
   }
 
  private:
+  PipelineSlot* FindSlot(j_compress_ptr cinfo) {
+    for (PipelineSlot& slot : slots_) {
+      if (slot.cinfo == cinfo) return &slot;
+    }
+    return nullptr;
+  }
+
+  PipelineSlot* FindFreeSlot() {
+    for (PipelineSlot& slot : slots_) {
+      if (slot.cinfo == nullptr) return &slot;
+    }
+    return nullptr;
+  }
+
+  size_t SlotIndex(const PipelineSlot* slot) const {
+    return static_cast<size_t>(slot - slots_.data());
+  }
+
+  bool WaitForSlot(PipelineSlot* slot) {
+    if (slot->ready) return true;
+    if (!slot->in_flight) return false;
+    const auto wait_start = std::chrono::steady_clock::now();
+    if (vkWaitForFences(device_, 1, &slot->fence, VK_TRUE, UINT64_MAX) !=
+        VK_SUCCESS) {
+      return false;
+    }
+    slot->in_flight = false;
+    slot->ready = true;
+    if (TraceEnabled()) {
+      const auto ready_time = std::chrono::steady_clock::now();
+      const double wait_ms =
+          std::chrono::duration<double, std::milli>(ready_time - wait_start)
+              .count();
+      const double submit_to_ready_ms =
+          std::chrono::duration<double, std::milli>(ready_time -
+                                                    slot->submit_time)
+              .count();
+      double gpu_ms = -1.0;
+      std::array<uint64_t, 2> timestamps = {};
+      if (slot->query_pool != VK_NULL_HANDLE && timestamp_valid_bits_ != 0 &&
+          vkGetQueryPoolResults(device_, slot->query_pool, 0, 2,
+                                sizeof(timestamps), timestamps.data(),
+                                sizeof(timestamps[0]),
+                                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        const uint64_t mask = timestamp_valid_bits_ >= 64
+                                  ? std::numeric_limits<uint64_t>::max()
+                                  : (uint64_t{1} << timestamp_valid_bits_) - 1;
+        const uint64_t ticks = (timestamps[1] - timestamps[0]) & mask;
+        gpu_ms = static_cast<double>(ticks) *
+                 properties_.limits.timestampPeriod / 1000000.0;
+      }
+      fprintf(stderr,
+              "jpegli amd-vulkan: slot %zu ready, gpu %.3f ms, wait %.3f "
+              "ms, submit-to-ready %.3f ms\n",
+              SlotIndex(slot), gpu_ms, wait_ms, submit_to_ready_ms);
+    }
+    return true;
+  }
+
+  void ReleaseSlot(PipelineSlot* slot) {
+    slot->cinfo = nullptr;
+    slot->in_flight = false;
+    slot->ready = false;
+    slot->cached_results.clear();
+  }
+
   bool Initialize() {
     if (initialization_attempted_) return available_;
     initialization_attempted_ = true;
@@ -520,6 +556,7 @@ class AmdVulkanProgressiveTokenizer {
       physical_device_ = candidate;
       properties_ = candidate_properties;
       queue_family_ = selected_family;
+      timestamp_valid_bits_ = families[selected_family].timestampValidBits;
       break;
     }
     if (physical_device_ == VK_NULL_HANDLE) {
@@ -641,10 +678,10 @@ class AmdVulkanProgressiveTokenizer {
 
     VkDescriptorPoolSize pool_size = {};
     pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = 2;
+    pool_size.descriptorCount = 2 * kPipelineSlots;
     VkDescriptorPoolCreateInfo pool_info = {};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.maxSets = 1;
+    pool_info.maxSets = kPipelineSlots;
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
     if (vkCreateDescriptorPool(device_, &pool_info, nullptr,
@@ -654,11 +691,17 @@ class AmdVulkanProgressiveTokenizer {
     VkDescriptorSetAllocateInfo set_info = {};
     set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     set_info.descriptorPool = descriptor_pool_;
-    set_info.descriptorSetCount = 1;
-    set_info.pSetLayouts = &descriptor_set_layout_;
-    if (vkAllocateDescriptorSets(device_, &set_info, &descriptor_set_) !=
+    std::array<VkDescriptorSetLayout, kPipelineSlots> set_layouts;
+    set_layouts.fill(descriptor_set_layout_);
+    std::array<VkDescriptorSet, kPipelineSlots> descriptor_sets = {};
+    set_info.descriptorSetCount = kPipelineSlots;
+    set_info.pSetLayouts = set_layouts.data();
+    if (vkAllocateDescriptorSets(device_, &set_info, descriptor_sets.data()) !=
         VK_SUCCESS) {
       return false;
+    }
+    for (size_t i = 0; i < kPipelineSlots; ++i) {
+      slots_[i].descriptor_set = descriptor_sets[i];
     }
 
     VkCommandPoolCreateInfo command_pool_info = {};
@@ -674,15 +717,34 @@ class AmdVulkanProgressiveTokenizer {
     command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     command_info.commandPool = command_pool_;
     command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    command_info.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(device_, &command_info, &command_buffer_) !=
-        VK_SUCCESS) {
+    command_info.commandBufferCount = kPipelineSlots;
+    std::array<VkCommandBuffer, kPipelineSlots> command_buffers = {};
+    if (vkAllocateCommandBuffers(device_, &command_info,
+                                 command_buffers.data()) != VK_SUCCESS) {
       return false;
+    }
+    for (size_t i = 0; i < kPipelineSlots; ++i) {
+      slots_[i].command_buffer = command_buffers[i];
     }
     VkFenceCreateInfo fence_info = {};
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    return vkCreateFence(device_, &fence_info, nullptr, &fence_) == VK_SUCCESS;
+    VkQueryPoolCreateInfo query_info = {};
+    query_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    query_info.queryCount = 2;
+    for (PipelineSlot& slot : slots_) {
+      if (vkCreateFence(device_, &fence_info, nullptr, &slot.fence) !=
+          VK_SUCCESS) {
+        return false;
+      }
+      if (timestamp_valid_bits_ != 0 &&
+          vkCreateQueryPool(device_, &query_info, nullptr, &slot.query_pool) !=
+              VK_SUCCESS) {
+        return false;
+      }
+    }
+    return true;
   }
 
   uint32_t FindMemoryType(uint32_t type_bits, VkMemoryPropertyFlags required,
@@ -708,7 +770,8 @@ class AmdVulkanProgressiveTokenizer {
     return best_index;
   }
 
-  bool EnsureBuffer(MappedBuffer* target, size_t requested_size) {
+  bool EnsureBuffer(PipelineSlot* slot, MappedBuffer* target,
+                    size_t requested_size) {
     if (target->size >= requested_size) return true;
     DestroyBuffer(target);
     VkDeviceSize allocation_size = std::max<size_t>(requested_size, 4096);
@@ -754,32 +817,32 @@ class AmdVulkanProgressiveTokenizer {
       return false;
     }
     target->size = allocation_size;
-    descriptors_dirty_ = true;
+    slot->descriptors_dirty = true;
     return true;
   }
 
-  bool UpdateDescriptors() {
-    if (!descriptors_dirty_) return true;
-    if (coefficient_buffer_.buffer == VK_NULL_HANDLE ||
-        descriptor_buffer_.buffer == VK_NULL_HANDLE) {
+  bool UpdateDescriptors(PipelineSlot* slot) {
+    if (!slot->descriptors_dirty) return true;
+    if (slot->coefficient_buffer.buffer == VK_NULL_HANDLE ||
+        slot->descriptor_buffer.buffer == VK_NULL_HANDLE) {
       return false;
     }
     std::array<VkDescriptorBufferInfo, 2> buffer_info = {};
-    buffer_info[0].buffer = coefficient_buffer_.buffer;
-    buffer_info[0].range = coefficient_buffer_.size;
-    buffer_info[1].buffer = descriptor_buffer_.buffer;
-    buffer_info[1].range = descriptor_buffer_.size;
+    buffer_info[0].buffer = slot->coefficient_buffer.buffer;
+    buffer_info[0].range = slot->coefficient_buffer.size;
+    buffer_info[1].buffer = slot->descriptor_buffer.buffer;
+    buffer_info[1].range = slot->descriptor_buffer.size;
     std::array<VkWriteDescriptorSet, 2> writes = {};
     for (uint32_t i = 0; i < writes.size(); ++i) {
       writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      writes[i].dstSet = descriptor_set_;
+      writes[i].dstSet = slot->descriptor_set;
       writes[i].dstBinding = i;
       writes[i].descriptorCount = 1;
       writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       writes[i].pBufferInfo = &buffer_info[i];
     }
     vkUpdateDescriptorSets(device_, writes.size(), writes.data(), 0, nullptr);
-    descriptors_dirty_ = false;
+    slot->descriptors_dirty = false;
     return true;
   }
 
@@ -798,9 +861,21 @@ class AmdVulkanProgressiveTokenizer {
   void ShutdownObjects() {
     if (device_ != VK_NULL_HANDLE) {
       vkDeviceWaitIdle(device_);
-      DestroyBuffer(&descriptor_buffer_);
-      DestroyBuffer(&coefficient_buffer_);
-      if (fence_ != VK_NULL_HANDLE) vkDestroyFence(device_, fence_, nullptr);
+      for (PipelineSlot& slot : slots_) {
+        DestroyBuffer(&slot.descriptor_buffer);
+        DestroyBuffer(&slot.coefficient_buffer);
+        if (slot.query_pool != VK_NULL_HANDLE) {
+          vkDestroyQueryPool(device_, slot.query_pool, nullptr);
+        }
+        if (slot.fence != VK_NULL_HANDLE) {
+          vkDestroyFence(device_, slot.fence, nullptr);
+        }
+        slot.query_pool = VK_NULL_HANDLE;
+        slot.fence = VK_NULL_HANDLE;
+        slot.command_buffer = VK_NULL_HANDLE;
+        slot.descriptor_set = VK_NULL_HANDLE;
+        ReleaseSlot(&slot);
+      }
       if (command_pool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(device_, command_pool_, nullptr);
       }
@@ -825,40 +900,37 @@ class AmdVulkanProgressiveTokenizer {
   }
 
   void Shutdown() {
-    active_cinfo_ = nullptr;
+    active_slot_ = nullptr;
     available_ = false;
     ShutdownObjects();
   }
 
   bool initialization_attempted_ = false;
   bool available_ = false;
-  bool descriptors_dirty_ = true;
-  j_compress_ptr active_cinfo_ = nullptr;
+  PipelineSlot* active_slot_ = nullptr;
+  std::array<PipelineSlot, kPipelineSlots> slots_;
   VkInstance instance_ = VK_NULL_HANDLE;
   VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
   VkPhysicalDeviceProperties properties_ = {};
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
   uint32_t queue_family_ = UINT32_MAX;
+  uint32_t timestamp_valid_bits_ = 0;
   VkDescriptorSetLayout descriptor_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
-  VkDescriptorSet descriptor_set_ = VK_NULL_HANDLE;
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
-  VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
-  VkFence fence_ = VK_NULL_HANDLE;
-  MappedBuffer coefficient_buffer_;
-  MappedBuffer descriptor_buffer_;
-  std::array<size_t, kMaxComponents> component_word_offsets_ = {};
-  std::array<size_t, kMaxComponents> component_num_blocks_ = {};
-  std::vector<AmdVulkanACResult> cached_results_;
   AmdTuningProfile tuning_profile_ = AmdTuningProfile::kOtherUnifiedAmd;
 };
 
 thread_local AmdVulkanProgressiveTokenizer g_amd_vulkan_tokenizer;
 
 }  // namespace
+
+bool AmdVulkanProgressiveSubmit(j_compress_ptr cinfo) {
+  return g_amd_vulkan_tokenizer.SubmitImage(cinfo);
+}
 
 bool AmdVulkanProgressiveBegin(j_compress_ptr cinfo) {
   return g_amd_vulkan_tokenizer.BeginImage(cinfo);

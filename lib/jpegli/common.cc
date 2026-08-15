@@ -6,12 +6,16 @@
 
 #include "lib/jpegli/common.h"
 
+#include "lib/jpegli/amd_vulkan_progressive.h"
 #include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/decode_internal.h"
 #include "lib/jpegli/memory_manager.h"
 #include "lib/jpegli/types.h"
 
 void jpegli_abort(j_common_ptr cinfo) {
+  if (!cinfo->is_decompressor) {
+    jpegli::AmdVulkanProgressiveEnd(reinterpret_cast<j_compress_ptr>(cinfo));
+  }
   if (cinfo->mem == nullptr) return;
   for (int pool_id = 0; pool_id < JPOOL_NUMPOOLS; ++pool_id) {
     if (pool_id == JPOOL_PERMANENT) continue;
@@ -25,6 +29,9 @@ void jpegli_abort(j_common_ptr cinfo) {
 }
 
 void jpegli_destroy(j_common_ptr cinfo) {
+  if (!cinfo->is_decompressor) {
+    jpegli::AmdVulkanProgressiveEnd(reinterpret_cast<j_compress_ptr>(cinfo));
+  }
   if (cinfo->mem == nullptr) return;
   (*cinfo->mem->self_destruct)(cinfo);
   if (cinfo->is_decompressor) {

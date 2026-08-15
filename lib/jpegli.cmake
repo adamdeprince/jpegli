@@ -33,8 +33,6 @@ if(JPEGLI_ENABLE_AMD_VULKAN)
   set_source_files_properties("${JPEGLI_AMD_VULKAN_SPV_HEADER}"
                               PROPERTIES GENERATED TRUE)
   list(APPEND JPEGLI_INTERNAL_JPEGLI_SOURCES
-    jpegli/amd_vulkan_progressive.cc
-    jpegli/amd_vulkan_progressive.h
     "${JPEGLI_AMD_VULKAN_SPV_HEADER}"
   )
 endif()
@@ -63,6 +61,8 @@ configure_file(
   ../third_party/libjpeg-turbo/jpeglib.h include/jpegli/jpeglib.h COPYONLY)
 configure_file(
   ../third_party/libjpeg-turbo/jmorecfg.h include/jpegli/jmorecfg.h COPYONLY)
+configure_file(
+  jpegli/pipeline.h include/jpegli/jpegli_pipeline.h COPYONLY)
 
 add_library(jpegli-static STATIC EXCLUDE_FROM_ALL "${JPEGLI_INTERNAL_JPEGLI_SOURCES}")
 target_compile_options(jpegli-static PRIVATE "${JPEGLI_INTERNAL_FLAGS}")

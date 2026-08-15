@@ -152,6 +152,8 @@ set(JPEGLI_INTERNAL_JPEGLI_LIBJPEG_HELPER_FILES
 set(JPEGLI_INTERNAL_JPEGLI_SOURCES
   jpegli/adaptive_quantization.cc
   jpegli/adaptive_quantization.h
+  jpegli/amd_vulkan_progressive.cc
+  jpegli/amd_vulkan_progressive.h
   jpegli/bit_writer.cc
   jpegli/bit_writer.h
   jpegli/bitstream.cc
@@ -194,6 +196,8 @@ set(JPEGLI_INTERNAL_JPEGLI_SOURCES
   jpegli/input.h
   jpegli/memory_manager.cc
   jpegli/memory_manager.h
+  jpegli/pipeline.h
+  jpegli/pipeline_internal.h
   jpegli/quant.cc
   jpegli/quant.h
   jpegli/render.cc

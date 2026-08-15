@@ -14,6 +14,8 @@
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/decode.h"
 #include "lib/jpegli/encode.h"
+#include "lib/jpegli/pipeline.h"
+#include "lib/jpegli/pipeline_internal.h"
 
 struct jpeg_error_mgr *jpeg_std_error(struct jpeg_error_mgr *err) {
   return jpegli_std_error(err);
@@ -243,6 +245,10 @@ void jpeg_write_coefficients(j_compress_ptr cinfo,
 
 void jpeg_finish_compress(j_compress_ptr cinfo) {
   jpegli_finish_compress(cinfo);
+}
+
+boolean jpegli_pipeline_submit(j_compress_ptr cinfo) {
+  return jpegli::PipelineSubmit(cinfo);
 }
 
 void jpeg_abort_compress(j_compress_ptr cinfo) { jpegli_abort_compress(cinfo); }

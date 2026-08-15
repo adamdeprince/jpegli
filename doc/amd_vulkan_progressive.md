@@ -36,7 +36,8 @@ resulting SPIR-V in `libjpegli-static`; an installed shader file is not needed.
 - `force`: GPU path regardless of image size, intended for testing
 
 `JPEGLI_AMD_VULKAN_TRACE=1` prints device selection, coefficient upload,
-batched dispatch, and CPU stitching timings.
+batched dispatch, Vulkan timestamp-query duration, host fence-wait time, and
+CPU stitching timings.
 
 Automatic mode keeps images below 4,096 total component blocks on the CPU.
 On Phoenix this is approximately the conservative crossover measured between
@@ -49,8 +50,9 @@ classifier to the encode path.
 The encoder uploads all quantized coefficient planes once into a persistently
 mapped, host-cached coherent storage buffer. All initial and refinement AC
 scans are then recorded into one command buffer and completed with one fence.
-The Vulkan device, queue, pipeline, command buffer, fence and grow-only buffers
-are retained per encoder thread across images.
+The Vulkan device, queue, and pipeline are retained per encoder thread. Two
+pipeline slots each retain independent coefficient and descriptor buffers,
+descriptor set, command buffer, fence, and timestamp query pool.
 
 One required AMD wave64 workgroup owns one 8x8 block:
 
@@ -68,6 +70,41 @@ One required AMD wave64 workgroup owns one 8x8 block:
 The fixed token/event representation is integer-only and preserves exact token
 order. Adding restart markers or changing the scan script is not required.
 
+### Split-phase endpoint
+
+`<jpegli_pipeline.h>` adds one experimental function:
+
+```c
+boolean jpegli_pipeline_submit(j_compress_ptr cinfo);
+```
+
+Call it after all input rows have been written and before
+`jpeg_finish_compress()`. A successful call copies the final quantized
+coefficients and queues GPU work without waiting. The existing finish function
+waits only when it reaches that image, stitches the GPU descriptors, and runs
+Huffman optimization, entropy encoding, and bit packing on the calling CPU
+thread. A false result is a transparent fallback: normal finish remains valid.
+
+The compressor must be submitted, finished or aborted on the same thread. The
+endpoint accepts ordinary progressive encodes whose quantization is final; it
+rejects coefficient-transcode state and PSNR-target mode because those paths
+can still modify coefficients during finish.
+
+A latency-oriented two-slot schedule is:
+
+```cpp
+prepare(slot[0], source.Next());
+jpegli_pipeline_submit(&slot[0].cinfo);  // GPU image n
+prepare(slot[1], source.Next());         // CPU image n + 1
+jpegli_pipeline_submit(&slot[1].cinfo);  // queue GPU image n + 1
+jpeg_finish_compress(&slot[0].cinfo);    // CPU entropy n; GPU runs n + 1
+```
+
+The application owns the streaming source and output sink. This avoids adding
+a virtual source abstraction, buffer copy, worker thread, or scheduler to the
+latency path. The accompanying C++ benchmark uses a generator-style `Next()`
+source and alternates the two compressor objects.
+
 ## Memory and latency choices
 
 Phoenix exposes a small device-local heap whose CPU mapping is uncached. Using
@@ -79,6 +116,29 @@ PCIe staging copy.
 The implementation batches scans rather than submitting per scan, row, or
 block. It retains independent descriptor regions for every scan so batching
 does not alter scan ordering or token state.
+
+## Phoenix capacity snapshot
+
+On the current Radeon 780M / RADV Phoenix machine, quality-90 runs over the 30
+decoded CLIC images measured the following. The source sequence was repeated
+in memory; PNG decode is outside the timing. GPU duration comes from Vulkan
+timestamp queries and busy percentage from amdgpu's sysfs counter.
+
+| Concurrent pipeline processes | Aggregate images/s | Images/s per process | Median GPU batch | Mean GPU busy |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 48.89 | 48.89 | 1.803 ms | 7.4% |
+| 2 | 89.94 | 44.97 | 3.257 ms | 12.9% |
+| 4 | 151.75 | 37.94 | 4.485 ms | 19.9% |
+
+One stream therefore consumes roughly 7--9% GPU duty cycle end to end, not the
+whole GPU. Each batch contains enough one-wave workgroups to occupy all CUs,
+so a simultaneously resident compute job stretches batch latency even though
+there is substantial idle time between JPEG batches. Two JPEG jobs lose about
+8% per-job throughput while gaining 1.84x aggregate throughput; four lose about
+22% per job while gaining 3.10x aggregate throughput. A sustained image-model
+kernel should be expected to contend during the JPEG batch rather than run
+with literally zero slowdown. The 8060S is expected to have more headroom but
+still needs the same measurement on Strix Halo hardware.
 
 ## Current scope
 
