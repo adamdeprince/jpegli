@@ -46,6 +46,13 @@ bool EnvironmentForcesGpu() {
   return value != nullptr && strcmp(value, "force") == 0;
 }
 
+bool EnvironmentEnablesThroughputFusion() {
+  const char* value = std::getenv("JPEGLI_AMD_VULKAN_THROUGHPUT");
+  if (value == nullptr) return false;
+  return strcmp(value, "0") != 0 && strcmp(value, "off") != 0 &&
+         strcmp(value, "false") != 0;
+}
+
 bool TraceEnabled() {
   const char* value = std::getenv("JPEGLI_AMD_VULKAN_TRACE");
   return value != nullptr && strcmp(value, "0") != 0;
@@ -79,13 +86,16 @@ struct PushConstants {
   uint32_t dispatch_width;
   uint32_t mode;
   uint32_t output_word_offset;
+  uint32_t scan_parameter_offset;
+  uint32_t scan_parameter_count;
 };
-static_assert(sizeof(PushConstants) == 40, "shader push-constant ABI changed");
+static_assert(sizeof(PushConstants) == 48, "shader push-constant ABI changed");
 
 struct PipelineSlot {
   j_compress_ptr cinfo = nullptr;
   MappedBuffer coefficient_buffer;
   MappedBuffer descriptor_buffer;
+  MappedBuffer scan_parameter_buffer;
   VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
   VkCommandBuffer command_buffer = VK_NULL_HANDLE;
   VkFence fence = VK_NULL_HANDLE;
@@ -251,6 +261,7 @@ class AmdVulkanProgressiveTokenizer {
   bool DispatchAllACScans(j_compress_ptr cinfo, PipelineSlot* slot) {
     struct ScanDispatch {
       int scan_index;
+      int component;
       uint32_t width;
       uint32_t height;
       PushConstants push;
@@ -259,6 +270,7 @@ class AmdVulkanProgressiveTokenizer {
     slot->cached_results.assign(cinfo->num_scans, {});
     size_t total_output_words = 0;
     size_t total_wave64_workgroups = 0;
+    const bool throughput_fusion = EnvironmentEnablesThroughputFusion();
     for (int scan_index = 0; scan_index < cinfo->num_scans; ++scan_index) {
       const jpeg_scan_info& scan = cinfo->scan_info[scan_index];
       if (scan.Ss <= 0 || scan.comps_in_scan != 1 || scan.Se < scan.Ss ||
@@ -295,12 +307,58 @@ class AmdVulkanProgressiveTokenizer {
           width,
           mode,
           static_cast<uint32_t>(total_output_words),
+          0,
+          0,
       };
-      dispatches.push_back({scan_index, width, height, push});
+      dispatches.push_back({scan_index, component, width, height, push});
       slot->cached_results[scan_index].stride_words = stride_words;
       slot->cached_results[scan_index].num_blocks = num_blocks;
       total_output_words += num_blocks * stride_words;
       total_wave64_workgroups += num_blocks;
+    }
+    struct FusedComponentDispatch {
+      uint32_t width;
+      uint32_t height;
+      PushConstants push;
+    };
+    std::vector<std::array<uint32_t, 8>> scan_parameters;
+    std::vector<FusedComponentDispatch> fused_dispatches;
+    size_t fused_wave64_workgroups = 0;
+    if (throughput_fusion) {
+      for (int component = 0; component < cinfo->num_components; ++component) {
+        const size_t parameter_begin = scan_parameters.size();
+        const ScanDispatch* first = nullptr;
+        for (const ScanDispatch& dispatch : dispatches) {
+          if (dispatch.component != component) continue;
+          if (first == nullptr) first = &dispatch;
+          scan_parameters.push_back({
+              dispatch.push.num_blocks,
+              dispatch.push.spectral_start,
+              dispatch.push.spectral_end,
+              dispatch.push.successive_low,
+              dispatch.push.output_stride_words,
+              dispatch.push.context,
+              dispatch.push.mode,
+              dispatch.push.output_word_offset,
+          });
+        }
+        if (first == nullptr) continue;
+        const size_t parameter_count = scan_parameters.size() - parameter_begin;
+        if (parameter_begin > std::numeric_limits<uint32_t>::max() ||
+            parameter_count > std::numeric_limits<uint32_t>::max()) {
+          return false;
+        }
+        PushConstants push = {};
+        push.coefficient_word_offset =
+            static_cast<uint32_t>(slot->component_word_offsets[component]);
+        push.num_blocks = first->push.num_blocks;
+        push.dispatch_width = first->width;
+        push.mode = 4;
+        push.scan_parameter_offset = static_cast<uint32_t>(parameter_begin);
+        push.scan_parameter_count = static_cast<uint32_t>(parameter_count);
+        fused_dispatches.push_back({first->width, first->height, push});
+        fused_wave64_workgroups += first->push.num_blocks;
+      }
     }
     if (dispatches.empty()) {
       slot->ready = true;
@@ -308,9 +366,16 @@ class AmdVulkanProgressiveTokenizer {
     }
     if (!EnsureBuffer(slot, &slot->descriptor_buffer,
                       total_output_words * sizeof(uint32_t)) ||
+        !EnsureBuffer(slot, &slot->scan_parameter_buffer,
+                      std::max<size_t>(scan_parameters.size() * 8, 1) *
+                          sizeof(uint32_t)) ||
         !UpdateDescriptors(slot)) {
       slot->cached_results.clear();
       return false;
+    }
+    if (!scan_parameters.empty()) {
+      memcpy(slot->scan_parameter_buffer.mapped, scan_parameters.data(),
+             scan_parameters.size() * sizeof(scan_parameters[0]));
     }
     const uint32_t* output =
         static_cast<const uint32_t*>(slot->descriptor_buffer.mapped);
@@ -351,11 +416,20 @@ class AmdVulkanProgressiveTokenizer {
     vkCmdBindDescriptorSets(slot->command_buffer,
                             VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0,
                             1, &slot->descriptor_set, 0, nullptr);
-    for (const ScanDispatch& dispatch : dispatches) {
-      vkCmdPushConstants(slot->command_buffer, pipeline_layout_,
-                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dispatch.push),
-                         &dispatch.push);
-      vkCmdDispatch(slot->command_buffer, dispatch.width, dispatch.height, 1);
+    if (!fused_dispatches.empty()) {
+      for (const FusedComponentDispatch& dispatch : fused_dispatches) {
+        vkCmdPushConstants(slot->command_buffer, pipeline_layout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(dispatch.push), &dispatch.push);
+        vkCmdDispatch(slot->command_buffer, dispatch.width, dispatch.height, 1);
+      }
+    } else {
+      for (const ScanDispatch& dispatch : dispatches) {
+        vkCmdPushConstants(slot->command_buffer, pipeline_layout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(dispatch.push), &dispatch.push);
+        vkCmdDispatch(slot->command_buffer, dispatch.width, dispatch.height, 1);
+      }
     }
     VkMemoryBarrier compute_to_host = {};
     compute_to_host.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -387,8 +461,11 @@ class AmdVulkanProgressiveTokenizer {
     if (TraceEnabled()) {
       fprintf(stderr,
               "jpegli amd-vulkan: submitted %zu AC scans, %zu wave64 "
-              "workgroups (%zu descriptor words) asynchronously\n",
-              dispatches.size(), total_wave64_workgroups, total_output_words);
+              "workgroups (%zu descriptor words, fused=%s) asynchronously\n",
+              dispatches.size(),
+              fused_dispatches.empty() ? total_wave64_workgroups
+                                       : fused_wave64_workgroups,
+              total_output_words, fused_dispatches.empty() ? "no" : "yes");
     }
     return true;
   }
@@ -616,7 +693,7 @@ class AmdVulkanProgressiveTokenizer {
   }
 
   bool CreatePipelineObjects() {
-    std::array<VkDescriptorSetLayoutBinding, 2> bindings = {};
+    std::array<VkDescriptorSetLayoutBinding, 3> bindings = {};
     for (uint32_t i = 0; i < bindings.size(); ++i) {
       bindings[i].binding = i;
       bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -678,7 +755,7 @@ class AmdVulkanProgressiveTokenizer {
 
     VkDescriptorPoolSize pool_size = {};
     pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = 2 * kPipelineSlots;
+    pool_size.descriptorCount = 3 * kPipelineSlots;
     VkDescriptorPoolCreateInfo pool_info = {};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pool_info.maxSets = kPipelineSlots;
@@ -824,15 +901,18 @@ class AmdVulkanProgressiveTokenizer {
   bool UpdateDescriptors(PipelineSlot* slot) {
     if (!slot->descriptors_dirty) return true;
     if (slot->coefficient_buffer.buffer == VK_NULL_HANDLE ||
-        slot->descriptor_buffer.buffer == VK_NULL_HANDLE) {
+        slot->descriptor_buffer.buffer == VK_NULL_HANDLE ||
+        slot->scan_parameter_buffer.buffer == VK_NULL_HANDLE) {
       return false;
     }
-    std::array<VkDescriptorBufferInfo, 2> buffer_info = {};
+    std::array<VkDescriptorBufferInfo, 3> buffer_info = {};
     buffer_info[0].buffer = slot->coefficient_buffer.buffer;
     buffer_info[0].range = slot->coefficient_buffer.size;
     buffer_info[1].buffer = slot->descriptor_buffer.buffer;
     buffer_info[1].range = slot->descriptor_buffer.size;
-    std::array<VkWriteDescriptorSet, 2> writes = {};
+    buffer_info[2].buffer = slot->scan_parameter_buffer.buffer;
+    buffer_info[2].range = slot->scan_parameter_buffer.size;
+    std::array<VkWriteDescriptorSet, 3> writes = {};
     for (uint32_t i = 0; i < writes.size(); ++i) {
       writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
       writes[i].dstSet = slot->descriptor_set;
@@ -862,6 +942,7 @@ class AmdVulkanProgressiveTokenizer {
     if (device_ != VK_NULL_HANDLE) {
       vkDeviceWaitIdle(device_);
       for (PipelineSlot& slot : slots_) {
+        DestroyBuffer(&slot.scan_parameter_buffer);
         DestroyBuffer(&slot.descriptor_buffer);
         DestroyBuffer(&slot.coefficient_buffer);
         if (slot.query_pool != VK_NULL_HANDLE) {

@@ -39,6 +39,14 @@ resulting SPIR-V in `libjpegli-static`; an installed shader file is not needed.
 batched dispatch, Vulkan timestamp-query duration, host fence-wait time, and
 CPU stitching timings.
 
+`JPEGLI_AMD_VULKAN_THROUGHPUT=1` selects the server-throughput shader schedule.
+The ordinary latency path dispatches each AC scan independently. Throughput
+mode groups the AC scans by component, loads each block's 64 coefficients once,
+and emits every initial/refinement descriptor for that component from the same
+wave64 workgroup. It does not change token layout, CPU stitching, entropy
+coding, or output bytes. Leaving the variable unset or setting it to `0`,
+`off`, or `false` retains the latency schedule.
+
 Automatic mode keeps images below 4,096 total component blocks on the CPU.
 On Phoenix this is approximately the conservative crossover measured between
 256x256 and 512x512 4:2:0 inputs. The threshold avoids Vulkan initialization,
@@ -54,7 +62,9 @@ The Vulkan device, queue, and pipeline are retained per encoder thread. Two
 pipeline slots each retain independent coefficient and descriptor buffers,
 descriptor set, command buffer, fence, and timestamp query pool.
 
-One required AMD wave64 workgroup owns one 8x8 block:
+One required AMD wave64 workgroup owns one 8x8 block. In latency mode it owns
+that block for one AC scan; in throughput mode it owns the block for all AC
+scans of one component:
 
 1. Each lane loads one coefficient.
 2. Subgroup ballots classify significant and future-significant coefficients.
@@ -69,6 +79,13 @@ One required AMD wave64 workgroup owns one 8x8 block:
 
 The fixed token/event representation is integer-only and preserves exact token
 order. Adding restart markers or changing the scan script is not required.
+
+The fused schedule keeps an eight-word parameter record per AC scan in a small
+coherent storage buffer. It reduces coefficient reads and wave launches by the
+number of AC scans per component without adding another Vulkan submission or a
+generic scheduling layer. The default Jpegli progressive script has four AC
+scans per component, so a representative 4 MP 4:2:0 encode falls from 393,216
+to 98,304 wave64 workgroups.
 
 ### Split-phase endpoint
 
