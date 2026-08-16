@@ -201,6 +201,20 @@ build-metal/tools/jpegli_decode_benchmark IMAGE_OR_DIRECTORY \
 The measured M4 results and methodology are recorded in
 [apple_metal_results.md](apple_metal_results.md).
 
+For energy comparisons, use the serial long-window campaign instead of the
+per-decode diagnostic counter:
+
+```sh
+tools/benchmark/run_apple_energy_campaign.sh \
+  build-metal/tools/jpegli_decode_benchmark \
+  /path/to/image-directory \
+  /path/to/new-output-directory
+```
+
+The M4 Max measurements and the distinction between process-attributed energy
+and whole-device power are documented in
+[apple_energy_results.md](apple_energy_results.md).
+
 The CSV includes cold/warm command-encoded, ready, and total latency; process
 CPU time and the macOS per-process energy counter to ready; MP/s; CPU entropy;
 Metal initialization; coefficient analysis/copy; command

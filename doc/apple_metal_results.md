@@ -181,10 +181,9 @@ quality 75 and above and both metrics at high-quality 4:4:4. Every accelerated
 path is pixel-identical to CPU JPEGli and therefore has the same perceptual
 scores.
 
-The benchmark also records macOS `ri_energy_nj` deltas for every serial
-decode. That process counter updates too coarsely for many sub-20-ms samples,
-producing zeros and delayed attribution between rotated paths. Raw values are
-retained for audit, but this run does not claim a path-level energy win.
-Process CPU time shows the offload benefit; defensible component energy
-measurement still requires external power instrumentation or a longer
-non-latency workload.
+The latency benchmark also records macOS `ri_energy_nj` around individual
+decodes, but that counter updates too coarsely for many sub-20-ms samples. A
+separate 44-minute campaign therefore used 1.5-second serial windows and five
+trials for each image/path. Its process-attributed energy results, raw-data
+method, and whole-device attribution limitations are recorded in
+[apple_energy_results.md](apple_energy_results.md).
