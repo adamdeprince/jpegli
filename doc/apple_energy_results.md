@@ -1,5 +1,9 @@
 # Apple M4 Max single-image decode energy results
 
+This campaign is incorporated into the broader experimental systems
+characterization in
+[paper/apple_metal_decoder_characterization.tex](paper/apple_metal_decoder_characterization.tex).
+
 This campaign measured five serial JPEG decode paths on an Apple M4 Max
 (40-core GPU, 128 GiB) running macOS 26.5.1:
 

@@ -1,5 +1,10 @@
 # Apple M4 Metal decoder results
 
+The paper-style experimental systems characterization, including methodology,
+latency, cold start, stage time, crossover, memory, energy, exactness,
+perceptual results, and threats to validity, is available as LaTeX source in
+[paper/apple_metal_decoder_characterization.tex](paper/apple_metal_decoder_characterization.tex).
+
 These measurements were taken on an Apple M4 Max (40-core GPU, 128 GiB) with
 macOS 26.5.1 in High Power Mode. The input corpus was the 30-image CLIC 2025
 test set (1.90--4.19 megapixels per image). JPEG encoding was excluded from all
