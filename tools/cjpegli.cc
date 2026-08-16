@@ -73,6 +73,15 @@ struct Args {
         "    Default: 2. Higher number is more scans, 0 means sequential.",
         &settings.progressive_level, &ParseSigned);
 
+    cmdline->AddOptionValue(
+        '\0', "restart_in_rows", "N",
+        "Emit a restart marker after N MCU rows in every scan.",
+        &settings.restart_in_rows, &ParseSigned, 2);
+
+    cmdline->AddOptionValue('\0', "restart_interval", "N",
+                            "Emit a restart marker after N MCUs in every scan.",
+                            &settings.restart_interval, &ParseSigned, 2);
+
     cmdline->AddOptionFlag('\0', "xyb", "Convert to XYB colorspace",
                            &settings.xyb, &SetBooleanTrue, 1);
 
@@ -141,6 +150,15 @@ bool ValidateArgs(const Args& args) {
   }
   if (settings.progressive_level < 0 || settings.progressive_level > 2) {
     fprintf(stderr, "Invalid --progressive_level argument\n");
+    return false;
+  }
+  if (settings.restart_in_rows < 0 || settings.restart_in_rows > 65535) {
+    fprintf(stderr, "Invalid --restart_in_rows argument\n");
+    return false;
+  }
+  if (settings.restart_interval < 0 || settings.restart_interval > 65535 ||
+      (settings.restart_interval > 0 && settings.restart_in_rows > 0)) {
+    fprintf(stderr, "Invalid --restart_interval argument\n");
     return false;
   }
   if (settings.progressive_level > 0 && !settings.optimize_coding) {

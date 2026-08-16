@@ -16,7 +16,7 @@
 extern "C" {
 #endif
 
-#define JPEGLI_DECODE_STAGE_PROFILE_ABI_VERSION 2u
+#define JPEGLI_DECODE_STAGE_PROFILE_ABI_VERSION 3u
 
 // Stages follow the decoder's implementation boundaries. Entropy decoding is
 // fused with run-length expansion, inverse coefficient ordering, DC prediction,
@@ -31,6 +31,11 @@ typedef enum jpegli_decode_stage_profile_stage {
   JPEGLI_DECODE_STAGE_PROGRESSIVE_COEFFICIENT_GPU_RECONSTRUCTION,
   JPEGLI_DECODE_STAGE_PROGRESSIVE_COEFFICIENT_READBACK,
   JPEGLI_DECODE_STAGE_PROGRESSIVE_COEFFICIENT_CPU_FALLBACK,
+  JPEGLI_DECODE_STAGE_PARALLEL_ENTROPY_INDEXING,
+  JPEGLI_DECODE_STAGE_PARALLEL_ENTROPY_UPLOAD,
+  JPEGLI_DECODE_STAGE_PARALLEL_ENTROPY_GPU_PARSE,
+  JPEGLI_DECODE_STAGE_PARALLEL_ENTROPY_READBACK,
+  JPEGLI_DECODE_STAGE_PARALLEL_ENTROPY_CPU_PARSE,
   JPEGLI_DECODE_STAGE_OUTPUT_PREPARATION,
   JPEGLI_DECODE_STAGE_DEQUANT_BIAS_SMOOTHING_AND_IDCT,
   JPEGLI_DECODE_STAGE_CHROMA_UPSAMPLING,
@@ -53,6 +58,10 @@ typedef struct jpegli_decode_stage_profile {
   uint64_t progressive_coefficient_events;
   uint64_t progressive_coefficient_count;
   uint64_t progressive_coefficient_gpu_device_ns;
+  uint64_t parallel_entropy_tasks;
+  uint64_t parallel_entropy_segments;
+  uint64_t parallel_entropy_bytes;
+  uint64_t parallel_entropy_gpu_device_ns;
   jpegli_decode_stage_profile_entry stages[JPEGLI_DECODE_STAGE_COUNT];
 } jpegli_decode_stage_profile;
 

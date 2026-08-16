@@ -159,6 +159,8 @@ libjpegli_jpegli_sources = [
     "jpegli/adaptive_quantization.h",
     "jpegli/amd_vulkan_decode_coefficients.cc",
     "jpegli/amd_vulkan_decode_coefficients.h",
+    "jpegli/amd_vulkan_decode_entropy.cc",
+    "jpegli/amd_vulkan_decode_entropy.h",
     "jpegli/amd_vulkan_progressive.cc",
     "jpegli/amd_vulkan_progressive.h",
     "jpegli/bit_writer.cc",

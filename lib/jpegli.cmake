@@ -24,6 +24,10 @@ if(JPEGLI_ENABLE_AMD_VULKAN)
       "${JPEGLI_AMD_VULKAN_GENERATED_DIR}/amd_vulkan_decode_coefficients.spv")
   set(JPEGLI_AMD_VULKAN_DECODE_COEFFICIENTS_SPV_HEADER
       "${JPEGLI_AMD_VULKAN_GENERATED_DIR}/amd_vulkan_decode_coefficients_spv.h")
+  set(JPEGLI_AMD_VULKAN_DECODE_ENTROPY_SPV
+      "${JPEGLI_AMD_VULKAN_GENERATED_DIR}/amd_vulkan_decode_entropy.spv")
+  set(JPEGLI_AMD_VULKAN_DECODE_ENTROPY_SPV_HEADER
+      "${JPEGLI_AMD_VULKAN_GENERATED_DIR}/amd_vulkan_decode_entropy_spv.h")
   add_custom_command(
     OUTPUT "${JPEGLI_AMD_VULKAN_SPV_HEADER}"
     COMMAND "${JPEGLI_GLSLC}" --target-env=vulkan1.3 -O
@@ -68,6 +72,21 @@ if(JPEGLI_ENABLE_AMD_VULKAN)
       "${CMAKE_CURRENT_SOURCE_DIR}/jpegli/amd_vulkan_decode_coefficients.comp"
       "${PROJECT_SOURCE_DIR}/cmake/EmbedBinary.cmake"
     VERBATIM)
+  add_custom_command(
+    OUTPUT "${JPEGLI_AMD_VULKAN_DECODE_ENTROPY_SPV_HEADER}"
+    COMMAND "${JPEGLI_GLSLC}" --target-env=vulkan1.3 -O
+            "${CMAKE_CURRENT_SOURCE_DIR}/jpegli/amd_vulkan_decode_entropy.comp"
+            -o "${JPEGLI_AMD_VULKAN_DECODE_ENTROPY_SPV}"
+    COMMAND "${CMAKE_COMMAND}"
+            "-DINPUT=${JPEGLI_AMD_VULKAN_DECODE_ENTROPY_SPV}"
+            "-DOUTPUT=${JPEGLI_AMD_VULKAN_DECODE_ENTROPY_SPV_HEADER}"
+            -DSYMBOL=kAmdVulkanDecodeEntropySpv
+            -DGUARD=JPEGLI_AMD_VULKAN_DECODE_ENTROPY_SPV_H_
+            -P "${PROJECT_SOURCE_DIR}/cmake/EmbedBinary.cmake"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/jpegli/amd_vulkan_decode_entropy.comp"
+      "${PROJECT_SOURCE_DIR}/cmake/EmbedBinary.cmake"
+    VERBATIM)
   set_source_files_properties("${JPEGLI_AMD_VULKAN_SPV_HEADER}"
                               PROPERTIES GENERATED TRUE)
   set_source_files_properties("${JPEGLI_AMD_VULKAN_FRONTEND_SPV_HEADER}"
@@ -75,10 +94,14 @@ if(JPEGLI_ENABLE_AMD_VULKAN)
   set_source_files_properties(
       "${JPEGLI_AMD_VULKAN_DECODE_COEFFICIENTS_SPV_HEADER}"
       PROPERTIES GENERATED TRUE)
+  set_source_files_properties(
+      "${JPEGLI_AMD_VULKAN_DECODE_ENTROPY_SPV_HEADER}"
+      PROPERTIES GENERATED TRUE)
   list(APPEND JPEGLI_INTERNAL_JPEGLI_SOURCES
     "${JPEGLI_AMD_VULKAN_SPV_HEADER}"
     "${JPEGLI_AMD_VULKAN_FRONTEND_SPV_HEADER}"
     "${JPEGLI_AMD_VULKAN_DECODE_COEFFICIENTS_SPV_HEADER}"
+    "${JPEGLI_AMD_VULKAN_DECODE_ENTROPY_SPV_HEADER}"
   )
 endif()
 

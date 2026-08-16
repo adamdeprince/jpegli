@@ -188,7 +188,57 @@ left the complete decoder 23.4% slower than stock. Even subtracting all readback
 leaves it 21.2% slower. The retained measurements are therefore evidence that
 coefficient reconstruction alone is too narrow a decoder GPU boundary.
 
-## Current scope
+## Parallel progressive entropy experiment
+
+The decoder also has an opt-in parser that moves the complete fused Huffman,
+run-length and coefficient-reconstruction loop onto independent tasks. It has
+two schedules:
+
+- one task per component when the file has no restart markers; and
+- one task per component/block interval when every progressive scan has
+  aligned restart markers.
+
+Each task processes its coefficient interval through that component's scans in
+progressive order. This preserves DC prediction, EOB runs and refinement
+dependencies inside the task while making coefficient ranges independent
+between tasks. No coefficient atomics or inter-task barriers are needed.
+
+`JPEGLI_AMD_VULKAN_DECODE_ENTROPY` selects the schedule:
+
+- `independent`: GPU component chains without restart markers;
+- `restart`: GPU restart-segment chains;
+- `cpu-independent`: matching CPU architecture control; and
+- `cpu-restart`: threaded CPU restart-segment parser.
+
+Unset, `0`, `off` or `false` preserves the stock loop.
+`JPEGLI_AMD_VULKAN_DECODE_ENTROPY_THREADS` sets the CPU worker count.
+`JPEGLI_AMD_VULKAN_TRACE=1` reports tasks, segments, entropy bytes, the Vulkan
+timestamp and host wait/readback duration.
+
+The GPU path requires an integrated coherent-memory AMD device, native 16-bit
+storage and a controllable 32-lane subgroup. The shader writes int16
+coefficients directly, forces RDNA wave32 for unrelated branch-heavy Huffman
+streams, and uses one submission per image. These capabilities are present on
+the measured Phoenix / Radeon 780M and are part of the Strix Halo / Radeon
+8060S target profile. The latter still requires on-device validation.
+
+The independent schedule exposes only three tasks for the default 4:2:0 scan
+script and is not useful: a representative 2.8 MP image took 1,534.72 ms of GPU
+device time. Restart interval 16 exposed enough work to reach 223.77 MP/s over
+the 30-image/four-scale latency matrix, 1.338x stock without restarts, but made
+the JPEG corpus 18.45% larger. At interval 32 the GPU no longer beat stock.
+
+The threaded CPU schedule is the stronger latency result on Phoenix. Restart
+interval 64 and 16 logical threads reached 308.47 MP/s, 1.845x stock without
+restarts, for 4.77% more bytes. Eight threads reached 294.61 MP/s. This consumes
+most of the host CPU and is therefore a latency result, not a claim about
+multi-request server throughput.
+
+The experimental encoder tool accepts `--restart_interval=N` and
+`--restart_in_rows=N` to create aligned inputs. Files without restart markers
+cannot acquire restart independence at decode time.
+
+## Encoder current scope
 
 - Initial progressive AC token formation: GPU
 - Progressive AC refinement classification/compaction: GPU

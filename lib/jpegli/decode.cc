@@ -17,6 +17,7 @@
 #include "lib/base/status.h"
 #include "lib/base/types.h"
 #include "lib/jpegli/amd_vulkan_decode_coefficients.h"
+#include "lib/jpegli/amd_vulkan_decode_entropy.h"
 #include "lib/jpegli/color_quantize.h"
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/common_internal.h"
@@ -71,6 +72,15 @@ void InitializeImage(j_decompress_ptr cinfo) {
   m->amd_decode_significant_.clear();
   m->amd_decode_negative_.clear();
   m->amd_decode_coefficient_events_.clear();
+  m->amd_decode_entropy_active_ = false;
+  m->amd_decode_entropy_gpu_ = false;
+  m->amd_decode_entropy_require_restarts_ = false;
+  m->amd_decode_entropy_finished_ = false;
+  m->amd_decode_entropy_total_coefficients_ = 0;
+  memset(m->amd_decode_entropy_component_block_offsets_, 0,
+         sizeof(m->amd_decode_entropy_component_block_offsets_));
+  m->amd_decode_entropy_bytes_.clear();
+  m->amd_decode_entropy_scans_.clear();
   m->is_multiscan_ = false;
   m->found_soi_ = false;
   m->found_dri_ = false;
@@ -335,7 +345,9 @@ int ConsumeInput(j_decompress_ptr cinfo) {
     if (cinfo->global_state == kDecProcessScan) {
       DecodeStageProfileTimer profile_timer(
           m->decode_stage_profile,
-          JPEGLI_DECODE_STAGE_ENTROPY_AND_COEFFICIENT_RECONSTRUCTION);
+          AmdVulkanDecodeEntropyActive(m)
+              ? JPEGLI_DECODE_STAGE_PARALLEL_ENTROPY_INDEXING
+              : JPEGLI_DECODE_STAGE_ENTROPY_AND_COEFFICIENT_RECONSTRUCTION);
       status = ProcessScan(cinfo, data, len, &pos, &m->codestream_bits_ahead_);
     } else {
       DecodeStageProfileTimer profile_timer(m->decode_stage_profile,
@@ -522,7 +534,9 @@ void AllocateCoefficientBuffer(j_decompress_ptr cinfo) {
   }
   cinfo->master->coef_arrays = coef_arrays;
   (*cinfo->mem->realize_virt_arrays)(comptr);
-  AmdVulkanDecodeCoefficientsPrepare(cinfo);
+  if (!AmdVulkanDecodeEntropyPrepare(cinfo)) {
+    AmdVulkanDecodeCoefficientsPrepare(cinfo);
+  }
 }
 
 void AllocateOutputBuffers(j_decompress_ptr cinfo) {
@@ -862,6 +876,9 @@ boolean jpegli_start_decompress(j_decompress_ptr cinfo) {
       }
     }
   }
+  if (!jpegli::AmdVulkanDecodeEntropyFinish(cinfo)) {
+    JPEGLI_ERROR("Failed to decode parallel progressive entropy");
+  }
   if (!jpegli::AmdVulkanDecodeCoefficientsFinish(cinfo)) {
     JPEGLI_ERROR("Failed to reconstruct progressive coefficients");
   }
@@ -1027,6 +1044,9 @@ jvirt_barray_ptr* jpegli_read_coefficients(j_decompress_ptr cinfo) {
       if (jpegli::ConsumeInput(cinfo) == JPEG_SUSPENDED) {
         return nullptr;
       }
+    }
+    if (!jpegli::AmdVulkanDecodeEntropyFinish(cinfo)) {
+      JPEGLI_ERROR("Failed to decode parallel progressive entropy");
     }
     if (!jpegli::AmdVulkanDecodeCoefficientsFinish(cinfo)) {
       JPEGLI_ERROR("Failed to reconstruct progressive coefficients");

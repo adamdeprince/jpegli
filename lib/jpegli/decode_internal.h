@@ -14,6 +14,7 @@
 #include "jpeglib.h"
 #include "lib/base/compiler_specific.h"
 #include "lib/jpegli/amd_vulkan_decode_coefficients.h"
+#include "lib/jpegli/amd_vulkan_decode_entropy.h"
 #include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/huffman.h"
 #include "lib/jpegli/types.h"
@@ -76,6 +77,18 @@ struct jpeg_decomp_master {
   std::vector<uint64_t> amd_decode_negative_;
   std::vector<jpegli::AmdVulkanDecodeCoefficientEvent>
       amd_decode_coefficient_events_;
+
+  // Experimental progressive entropy capture. Non-interleaved scans are
+  // grouped into independent component chains; aligned restart segments split
+  // those chains into independent block ranges.
+  bool amd_decode_entropy_active_;
+  bool amd_decode_entropy_gpu_;
+  bool amd_decode_entropy_require_restarts_;
+  bool amd_decode_entropy_finished_;
+  size_t amd_decode_entropy_total_coefficients_;
+  size_t amd_decode_entropy_component_block_offsets_[jpegli::kMaxComponents];
+  std::vector<uint8_t> amd_decode_entropy_bytes_;
+  std::vector<jpegli::AmdVulkanDecodeEntropyScan> amd_decode_entropy_scans_;
 
   bool streaming_mode_;
 

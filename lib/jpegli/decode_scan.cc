@@ -863,6 +863,9 @@ int ProcessScanImpl(j_decompress_ptr cinfo, const uint8_t* const data,
 
 int ProcessScan(j_decompress_ptr cinfo, const uint8_t* const data,
                 const size_t len, size_t* pos, size_t* bit_pos) {
+  if (AmdVulkanDecodeEntropyActive(cinfo->master)) {
+    return AmdVulkanDecodeEntropyCaptureScan(cinfo, data, len, pos, bit_pos);
+  }
   return cinfo->master->amd_decode_coefficients_active_
              ? ProcessScanImpl<true>(cinfo, data, len, pos, bit_pos)
              : ProcessScanImpl<false>(cinfo, data, len, pos, bit_pos);

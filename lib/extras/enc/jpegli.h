@@ -31,6 +31,8 @@ struct JpegSettings {
   bool use_std_quant_tables = false;
   int progressive_level = 2;
   bool optimize_coding = true;
+  int restart_interval = 0;
+  int restart_in_rows = 0;
   std::string chroma_subsampling;
   int libjpeg_quality = 0;
   std::string libjpeg_chroma_subsampling;

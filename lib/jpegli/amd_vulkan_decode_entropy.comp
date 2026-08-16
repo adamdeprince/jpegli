@@ -1,0 +1,298 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+// Each invocation owns one component/block-range chain. With no restart
+// markers there are only three long-running tasks (one per component). With
+// aligned restart markers, hundreds of invocations independently parse the
+// same spatial range through every progressive scan for that component.
+
+// Huffman decoding is branch-heavy and every lane follows an independent
+// bitstream. Force one RDNA wave32 per workgroup so divergence cannot tie two
+// unrelated 32-lane waves together and so short restart tasks schedule more
+// evenly across the CUs.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer EntropyBuffer {
+  uint entropy_words[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer TaskBuffer {
+  uint task_words[];
+};
+layout(std430, set = 0, binding = 2) readonly buffer SegmentBuffer {
+  uint segment_words[];
+};
+layout(std430, set = 0, binding = 3) readonly buffer HuffmanBuffer {
+  uint huffman_luts[];
+};
+layout(std430, set = 0, binding = 4) buffer CoefficientBuffer {
+  int16_t coefficients[];
+};
+layout(std430, set = 0, binding = 5) writeonly buffer PackedBuffer {
+  uint packed_coefficients[];
+};
+layout(std430, set = 0, binding = 6) buffer StatusBuffer {
+  uint task_status[];
+};
+
+layout(push_constant) uniform PushConstants {
+  uint item_count;
+  uint coefficient_count;
+  uint mode;
+  uint base_index;
+} pc;
+
+const uint kNaturalOrder[64] = uint[64](
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21,
+    28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37,
+    44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54,
+    47, 55, 62, 63);
+
+struct BitReader {
+  uint pos;
+  uint end;
+  uint bits;
+  uint bits_left;
+  uint loaded_valid_bits;
+  uint consumed_bits;
+  bool ok;
+};
+
+uint entropyByte(uint pos) {
+  return (entropy_words[pos >> 2u] >> ((pos & 3u) * 8u)) & 0xffu;
+}
+
+void fillBits(inout BitReader reader, uint count) {
+  while (reader.ok && reader.bits_left < count) {
+    if (reader.pos >= reader.end) {
+      // A lookup may peek through the marker. Virtual zeroes may be observed
+      // but reader.ok becomes false if a decoder tries to consume them.
+      reader.bits <<= 8u;
+      reader.bits_left += 8u;
+    } else {
+      uint next = entropyByte(reader.pos++);
+      if (next == 0xffu) {
+        if (reader.pos >= reader.end || entropyByte(reader.pos) != 0u) {
+          reader.ok = false;
+          return;
+        }
+        ++reader.pos;
+      }
+      reader.bits = (reader.bits << 8u) | next;
+      reader.bits_left += 8u;
+      reader.loaded_valid_bits += 8u;
+    }
+  }
+}
+
+uint peekBits(inout BitReader reader, uint count) {
+  if (count == 0u) return 0u;
+  fillBits(reader, count);
+  if (!reader.ok) return 0u;
+  return (reader.bits >> (reader.bits_left - count)) &
+         ((1u << count) - 1u);
+}
+
+void consumeBits(inout BitReader reader, uint count) {
+  fillBits(reader, count);
+  if (!reader.ok) return;
+  reader.bits_left -= count;
+  reader.consumed_bits += count;
+  if (reader.consumed_bits > reader.loaded_valid_bits) reader.ok = false;
+}
+
+uint readBits(inout BitReader reader, uint count) {
+  uint value = peekBits(reader, count);
+  consumeBits(reader, count);
+  return value;
+}
+
+uint readSymbol(inout BitReader reader, uint lut_offset) {
+  uint root_value = peekBits(reader, 8u);
+  if (!reader.ok) return 0xffffffffu;
+  uint root_index = lut_offset + root_value;
+  uint root = huffman_luts[root_index];
+  uint root_bits = root & 0xffu;
+  if (root_bits <= 8u) {
+    consumeBits(reader, root_bits);
+    return root >> 16u;
+  }
+  consumeBits(reader, 8u);
+  uint table_bits = root_bits - 8u;
+  uint low = peekBits(reader, table_bits);
+  uint second = huffman_luts[root_index + (root >> 16u) + low];
+  consumeBits(reader, second & 0xffu);
+  return second >> 16u;
+}
+
+int huffExtend(uint value, uint size) {
+  int threshold = 1 << int(size - 1u);
+  return value >= uint(threshold) ? int(value)
+                             : int(value) - (1 << int(size)) + 1;
+}
+
+bool decodeInitial(inout BitReader reader, uint params, uint dc_lut,
+                   uint ac_lut, inout int last_dc, inout int eobrun,
+                   uint coefficient_base) {
+  int ss = int(params & 0xffu);
+  int se = int((params >> 8u) & 0xffu);
+  int al = int((params >> 24u) & 0xffu);
+  int amplitude = 1 << al;
+  bool eobrun_allowed = ss > 0;
+  if (ss == 0) {
+    uint symbol = readSymbol(reader, dc_lut);
+    if (symbol >= 12u) return false;
+    int difference = 0;
+    if (symbol > 0u) difference = huffExtend(readBits(reader, symbol), symbol);
+    last_dc += difference;
+    int value = last_dc * amplitude;
+    if (value < -32768 || value > 32767) return false;
+    coefficients[coefficient_base] = int16_t(value);
+    ++ss;
+  }
+  if (ss > se) return reader.ok;
+  if (eobrun > 0) {
+    --eobrun;
+    return true;
+  }
+  for (int k = ss; k <= se; ++k) {
+    uint symbol = readSymbol(reader, ac_lut);
+    if (symbol >= 256u) return false;
+    int run = int(symbol >> 4u);
+    int size = int(symbol & 15u);
+    if (size > 0) {
+      k += run;
+      if (k > se || size + al >= 12) return false;
+      int value = huffExtend(readBits(reader, uint(size)), uint(size));
+      coefficients[coefficient_base + kNaturalOrder[k]] =
+          int16_t(value * amplitude);
+    } else if (run == 15) {
+      k += 15;
+    } else {
+      eobrun = 1 << run;
+      if (run > 0) {
+        if (!eobrun_allowed) return false;
+        eobrun += int(readBits(reader, uint(run)));
+      }
+      break;
+    }
+  }
+  --eobrun;
+  return reader.ok;
+}
+
+bool refine(inout BitReader reader, uint params, uint ac_lut,
+            inout int eobrun, uint coefficient_base) {
+  int ss = int(params & 0xffu);
+  int se = int((params >> 8u) & 0xffu);
+  int al = int((params >> 24u) & 0xffu);
+  int p1 = 1 << al;
+  int m1 = -p1;
+  bool eobrun_allowed = ss > 0;
+  if (ss == 0) {
+    coefficients[coefficient_base] = int16_t(
+        int(coefficients[coefficient_base]) |
+        (int(readBits(reader, 1u)) * p1));
+    ++ss;
+  }
+  if (ss > se) return reader.ok;
+  int k = ss;
+  bool in_zero_run = false;
+  if (eobrun <= 0) {
+    for (; k <= se; ++k) {
+      uint symbol = readSymbol(reader, ac_lut);
+      if (symbol >= 256u) return false;
+      int run = int(symbol >> 4u);
+      int value_size = int(symbol & 15u);
+      int new_value = 0;
+      if (value_size != 0) {
+        if (value_size != 1) return false;
+        new_value = readBits(reader, 1u) != 0u ? p1 : m1;
+        in_zero_run = false;
+      } else {
+        if (run != 15) {
+          eobrun = 1 << run;
+          if (run > 0) {
+            if (!eobrun_allowed) return false;
+            eobrun += int(readBits(reader, uint(run)));
+          }
+          break;
+        }
+        in_zero_run = true;
+      }
+      do {
+        uint position = coefficient_base + kNaturalOrder[k];
+        int current = int(coefficients[position]);
+        if (current != 0) {
+          if (readBits(reader, 1u) != 0u && (current & p1) == 0) {
+            current += current >= 0 ? p1 : m1;
+            coefficients[position] = int16_t(current);
+          }
+        } else if (--run < 0) {
+          break;
+        }
+        ++k;
+      } while (k <= se);
+      if (new_value != 0) {
+        if (k > se) return false;
+        coefficients[coefficient_base + kNaturalOrder[k]] =
+            int16_t(new_value);
+      }
+    }
+  }
+  if (in_zero_run) return false;
+  if (eobrun > 0) {
+    for (; k <= se; ++k) {
+      uint position = coefficient_base + kNaturalOrder[k];
+      int current = int(coefficients[position]);
+      if (current != 0 && readBits(reader, 1u) != 0u &&
+          (current & p1) == 0) {
+        current += current >= 0 ? p1 : m1;
+        coefficients[position] = int16_t(current);
+      }
+    }
+  }
+  --eobrun;
+  return reader.ok;
+}
+
+bool decodeTask(uint task_index) {
+  uint first_segment = task_words[2u * task_index];
+  uint scan_count = task_words[2u * task_index + 1u];
+  for (uint scan_in_task = 0u; scan_in_task < scan_count; ++scan_in_task) {
+    uint segment = first_segment + scan_in_task;
+    uint base = 8u * segment;
+    uint data_offset = segment_words[base];
+    uint data_size = segment_words[base + 1u];
+    uint block_base = segment_words[base + 2u];
+    uint block_count = segment_words[base + 3u];
+    uint params = segment_words[base + 4u];
+    uint dc_lut = segment_words[base + 5u];
+    uint ac_lut = segment_words[base + 6u];
+    BitReader reader = BitReader(data_offset, data_offset + data_size, 0u, 0u,
+                                 0u, 0u, true);
+    int last_dc = 0;
+    int eobrun = -1;
+    for (uint block = 0u; block < block_count; ++block) {
+      uint coefficient_base = (block_base + block) * 64u;
+      bool ok = ((params >> 16u) & 0xffu) == 0u
+                    ? decodeInitial(reader, params, dc_lut, ac_lut, last_dc,
+                                    eobrun, coefficient_base)
+                    : refine(reader, params, ac_lut, eobrun,
+                             coefficient_base);
+      if (!ok) return false;
+    }
+    if (!reader.ok || eobrun > 0) return false;
+  }
+  return true;
+}
+
+void main() {
+  uint index = pc.base_index + gl_GlobalInvocationID.x;
+  if (pc.mode == 0u) {
+    if (index >= pc.item_count) return;
+    task_status[index] = decodeTask(index) ? 0u : 1u;
+    return;
+  }
+}

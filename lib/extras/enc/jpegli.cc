@@ -453,6 +453,8 @@ Status EncodeJpeg(const PackedPixelFile& ppf, const JpegSettings& jpeg_settings,
     }
     jpegli_set_progressive_level(&cinfo, jpeg_settings.progressive_level);
     cinfo.optimize_coding = TO_JPEGLI_BOOL(jpeg_settings.optimize_coding);
+    cinfo.restart_interval = jpeg_settings.restart_interval;
+    cinfo.restart_in_rows = jpeg_settings.restart_in_rows;
     if (!jpeg_settings.app_data.empty()) {
       // Make sure jpegli_start_compress() does not write any APP markers.
       cinfo.write_JFIF_header = JPEGLI_FALSE;
