@@ -3,22 +3,28 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 
-// One AMD wave64 workgroup owns one JPEG block. The latency path dispatches
-// once per scan. Throughput mode dispatches once per component and reuses the
-// coefficient load across every AC scan for that component.
+// One AMD wave64 workgroup owns one JPEG block. Descriptor generation uses
+// every lane to classify coefficients. Latency compaction converts blocks in
+// parallel, resolves the small amount of cross-block EOB state in one wave,
+// and scatters the final ordered streams without CPU JPEG logic.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer CoefficientBuffer {
   uint coefficient_words[];
 };
 
-layout(set = 0, binding = 1, std430) writeonly buffer DescriptorBuffer {
+layout(set = 0, binding = 1, std430) buffer DescriptorBuffer {
   uint descriptor_words[];
 };
 
-// Eight words per scan: block count, Ss, Se, Al, descriptor stride, context,
-// initial/refinement mode, and descriptor output offset.
-layout(set = 0, binding = 2, std430) readonly buffer ScanParameterBuffer {
+layout(set = 0, binding = 2, std430) buffer CompactBuffer {
+  uint compact_words[];
+};
+
+// Twenty words per scan. The first eight are block count, Ss, Se, Al,
+// descriptor stride, context, initial/refinement mode, and descriptor offset.
+// The remaining words carry compact-stream enablement, offsets, and limits.
+layout(set = 0, binding = 3, std430) readonly buffer ScanParameterBuffer {
   uint scan_parameter_words[];
 };
 
@@ -35,6 +41,14 @@ layout(push_constant) uniform PushConstants {
   uint output_word_offset;
   uint scan_parameter_offset;
   uint scan_parameter_count;
+  uint compact_header_word_offset;
+  uint compact_token_word_offset;
+  uint compact_refbit_word_offset;
+  uint compact_eobrun_word_offset;
+  uint compact_scratch_word_offset;
+  uint compact_scratch_stride_words;
+  uint compact_token_capacity;
+  uint compact_refbit_capacity;
 } pc;
 
 shared uint active_positions[64];
@@ -45,10 +59,527 @@ int LoadCoefficient(uint block, uint coefficient) {
   return bitfieldExtract(int(packed), int((half_index & 1u) * 16u), 16);
 }
 
+void EmitProgressiveDC(uint block, uint lane, int coefficient) {
+  if (lane != 0u) return;
+  int current = coefficient >> int(pc.successive_low);
+  int previous = 0;
+  if (block != 0u) {
+    previous =
+        LoadCoefficient(block - 1u, 0u) >> int(pc.successive_low);
+  }
+  int difference = current - previous;
+  int magnitude = difference;
+  int encoded_bits = difference;
+  if (magnitude < 0) {
+    magnitude = -magnitude;
+    --encoded_bits;
+  }
+  uint nbits = magnitude == 0 ? 0u : uint(findMSB(uint(magnitude)) + 1);
+  uint mask = nbits == 0u ? 0u : (1u << nbits) - 1u;
+  uint packed = pc.context | (nbits << 8u) |
+                ((uint(encoded_bits) & mask) << 16u);
+  compact_words[pc.compact_token_word_offset + block] = packed;
+  atomicAdd(compact_words[pc.compact_refbit_word_offset + nbits], 1u);
+  if (block == 0u) {
+    compact_words[pc.compact_header_word_offset] = pc.num_blocks;
+    compact_words[pc.compact_header_word_offset + 1u] = pc.context;
+    compact_words[pc.compact_header_word_offset + 2u] = 1u;
+  }
+}
+
+uint PackInitialEob(uint run) {
+  uint nbits = uint(findMSB(run));
+  uint symbol = nbits << 4u;
+  uint bits = run & ((1u << nbits) - 1u);
+  return pc.context | (symbol << 8u) | (bits << 16u);
+}
+
+void CompactInitialGroupSummary() {
+  uint group = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+  uint block_begin = group * 256u;
+  if (block_begin >= pc.num_blocks) return;
+  uint block_end = min(block_begin + 256u, pc.num_blocks);
+  uint leading_eob = 0u;
+  uint eob_run = 0u;
+  uint local_tokens = 0u;
+  uint num_nonzeros = 0u;
+  uint num_future_nonzeros = 0u;
+  bool saw_tokens = false;
+  for (uint block = block_begin; block < block_end; ++block) {
+    uint scratch = pc.compact_scratch_word_offset +
+                   block * pc.compact_scratch_stride_words;
+    uint block_tokens = compact_words[scratch];
+    uint metadata = compact_words[scratch + 1u];
+    if (block_tokens != 0u) {
+      if (!saw_tokens) {
+        leading_eob = eob_run;
+        saw_tokens = true;
+      } else if (eob_run != 0u) {
+        ++local_tokens;
+      }
+      eob_run = 0u;
+      local_tokens += block_tokens;
+    }
+    if ((metadata & (1u << 16u)) != 0u) {
+      ++eob_run;
+    }
+    num_nonzeros += metadata & 0xffu;
+    num_future_nonzeros += (metadata >> 8u) & 0xffu;
+  }
+  if (!saw_tokens) {
+    leading_eob = eob_run;
+    eob_run = 0u;
+  }
+  uint group_base = pc.compact_scratch_word_offset + pc.num_blocks * 3u +
+                    group * 8u;
+  compact_words[group_base] = leading_eob;
+  compact_words[group_base + 1u] = uint(saw_tokens);
+  compact_words[group_base + 2u] = local_tokens;
+  compact_words[group_base + 3u] = eob_run;
+  compact_words[group_base + 4u] = num_nonzeros;
+  compact_words[group_base + 5u] = num_future_nonzeros;
+}
+
+void CompactInitialGlobalState() {
+  if (gl_LocalInvocationID.x != 0u) return;
+  uint group_count = (pc.num_blocks + 255u) / 256u;
+  uint next_token = 0u;
+  uint eob_run = 0u;
+  uint num_nonzeros = 0u;
+  uint num_future_nonzeros = 0u;
+  uint groups = pc.compact_scratch_word_offset + pc.num_blocks * 3u;
+  for (uint group = 0u; group < group_count; ++group) {
+    uint group_base = groups + group * 8u;
+    uint leading_eob = compact_words[group_base];
+    bool has_tokens = compact_words[group_base + 1u] != 0u;
+    compact_words[group_base + 6u] = next_token;
+    compact_words[group_base + 7u] = eob_run;
+    uint combined_eob = eob_run + leading_eob;
+    if (has_tokens) {
+      next_token += combined_eob / 0x7fffu;
+      if ((combined_eob % 0x7fffu) != 0u) ++next_token;
+      next_token += compact_words[group_base + 2u];
+      eob_run = compact_words[group_base + 3u];
+    } else {
+      next_token += combined_eob / 0x7fffu;
+      eob_run = combined_eob % 0x7fffu;
+    }
+    num_nonzeros += compact_words[group_base + 4u];
+    num_future_nonzeros += compact_words[group_base + 5u];
+  }
+  if (eob_run != 0u) {
+    compact_words[pc.compact_token_word_offset + next_token++] =
+        PackInitialEob(eob_run);
+  }
+  uint header = pc.compact_header_word_offset;
+  compact_words[header] = next_token;
+  compact_words[header + 1u] = num_nonzeros;
+  compact_words[header + 2u] = num_future_nonzeros;
+  compact_words[header + 3u] = uint(next_token <= pc.compact_token_capacity);
+}
+
+void CompactInitialGroupFinalize() {
+  uint group = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+  uint block_begin = group * 256u;
+  if (block_begin >= pc.num_blocks) return;
+  uint block_end = min(block_begin + 256u, pc.num_blocks);
+  uint group_base = pc.compact_scratch_word_offset + pc.num_blocks * 3u +
+                    group * 8u;
+  uint next_token = compact_words[group_base + 6u];
+  uint eob_run = compact_words[group_base + 7u];
+  for (uint block = block_begin; block < block_end; ++block) {
+    uint scratch = pc.compact_scratch_word_offset + block * 3u;
+    uint block_tokens = compact_words[scratch];
+    uint metadata = compact_words[scratch + 1u];
+    if (block_tokens != 0u) {
+      if (eob_run != 0u) {
+        compact_words[pc.compact_token_word_offset + next_token++] =
+            PackInitialEob(eob_run);
+        eob_run = 0u;
+      }
+      compact_words[scratch + 2u] = next_token;
+      next_token += block_tokens;
+    } else {
+      compact_words[scratch + 2u] = 0xffffffffu;
+    }
+    if ((metadata & (1u << 16u)) != 0u) {
+      ++eob_run;
+      if (eob_run == 0x7fffu) {
+        compact_words[pc.compact_token_word_offset + next_token++] =
+            PackInitialEob(eob_run);
+        eob_run = 0u;
+      }
+    }
+  }
+}
+
+void PrepareInitialBlock(uint block, uint output_stride_words,
+                         uint output_word_offset,
+                         uint compact_scratch_word_offset,
+                         uint compact_scratch_stride_words) {
+  uint input_base = output_word_offset + block * output_stride_words;
+  uint scratch = compact_scratch_word_offset +
+                 block * compact_scratch_stride_words;
+  compact_words[scratch] = descriptor_words[input_base];
+  compact_words[scratch + 1u] = descriptor_words[input_base + 1u];
+}
+
+void ScatterInitialBlock(uint block, uint lane, uint output_stride_words,
+                         uint output_word_offset,
+                         uint compact_token_word_offset,
+                         uint compact_scratch_word_offset,
+                         uint compact_scratch_stride_words) {
+  uint input_base = output_word_offset + block * output_stride_words;
+  uint block_tokens = descriptor_words[input_base];
+  uint scratch = compact_scratch_word_offset +
+                 block * compact_scratch_stride_words;
+  uint output_offset = compact_words[scratch + 2u];
+  if (output_offset == 0xffffffffu) return;
+  for (uint i = 0u; i < block_tokens; ++i) {
+    compact_words[compact_token_word_offset + output_offset + i] =
+        descriptor_words[input_base + 2u + i];
+  }
+}
+
+// Refinement scratch layout per block:
+//   0 fixed-token count, 1 correction-bit count, 2 trailing-EOB flag,
+//   3 trailing-EOB correction-bit count, 4 final token offset,
+//   5 final correction-bit offset, 6 new-nonzero count,
+//   7..8 packed correction bits, 9.. local uint32 RefToken values.
+void PrepareRefinementBlock(uint block, uint num_blocks, uint spectral_start,
+                            uint spectral_end, uint output_stride_words,
+                            uint output_word_offset,
+                            uint compact_scratch_word_offset,
+                            uint compact_scratch_stride_words,
+                            uint shared_event_count,
+                            bool events_are_shared) {
+  uint input_base = output_word_offset + block * output_stride_words;
+  uint local_tokens = compact_scratch_word_offset + num_blocks * 9u +
+                      block * compact_scratch_stride_words;
+  uint num_events =
+      events_are_shared ? shared_event_count : descriptor_words[input_base];
+  uint next_token = 0u;
+  uint fixed_tokens = 0u;
+  uint refbit_count = 0u;
+  uint refbits_low = 0u;
+  uint refbits_high = 0u;
+  uint num_eob_refinement_bits = 0u;
+  uint num_refinement_bits = 0u;
+  uint num_nonzeros = 0u;
+  uint zero_run = 0u;
+  uint previous_position = spectral_start - 1u;
+
+  for (uint event_index = 0u; event_index < num_events; ++event_index) {
+    uint event = events_are_shared
+                     ? active_positions[event_index]
+                     : descriptor_words[input_base + 2u + event_index];
+    uint position = event & 0xffu;
+    zero_run += position - previous_position - 1u;
+    previous_position = position;
+    while (zero_run > 15u) {
+      compact_words[local_tokens + next_token++] =
+          0xf0u | (num_refinement_bits << 8u);
+      zero_run -= 16u;
+      num_eob_refinement_bits += num_refinement_bits;
+      num_refinement_bits = 0u;
+    }
+    bool existing_nonzero = (event & (1u << 8u)) != 0u;
+    if (existing_nonzero) {
+      uint bit = (event >> 9u) & 1u;
+      if (refbit_count < 32u) {
+        refbits_low |= bit << refbit_count;
+      } else {
+        refbits_high |= bit << (refbit_count - 32u);
+      }
+      ++refbit_count;
+      ++num_refinement_bits;
+      continue;
+    }
+    uint positive = (event >> 10u) & 1u;
+    uint symbol = (zero_run << 4u) + 1u + (positive << 1u);
+    compact_words[local_tokens + next_token++] =
+        symbol | (num_refinement_bits << 8u);
+    ++num_nonzeros;
+    num_refinement_bits = 0u;
+    num_eob_refinement_bits = 0u;
+    zero_run = 0u;
+    fixed_tokens = next_token;
+  }
+  zero_run += spectral_end - previous_position;
+  uint trailing_refbits = num_eob_refinement_bits + num_refinement_bits;
+  bool trailing_eob = zero_run != 0u || trailing_refbits != 0u;
+  if (!trailing_eob) fixed_tokens = next_token;
+
+  compact_words[compact_scratch_word_offset + block] = fixed_tokens;
+  compact_words[compact_scratch_word_offset + num_blocks + block] =
+      refbit_count;
+  compact_words[compact_scratch_word_offset + 2u * num_blocks + block] =
+      uint(trailing_eob);
+  compact_words[compact_scratch_word_offset + 3u * num_blocks + block] =
+      trailing_refbits;
+  compact_words[compact_scratch_word_offset + 4u * num_blocks + block] =
+      0xffffffffu;
+  compact_words[compact_scratch_word_offset + 5u * num_blocks + block] = 0u;
+  compact_words[compact_scratch_word_offset + 6u * num_blocks + block] =
+      num_nonzeros;
+  compact_words[compact_scratch_word_offset + 7u * num_blocks + block] =
+      refbits_low;
+  compact_words[compact_scratch_word_offset + 8u * num_blocks + block] =
+      refbits_high;
+}
+
+void EmitRefinementEob(inout uint next_token, inout uint next_eobrun,
+                       uint run, uint refbits) {
+  uint nbits = uint(findMSB(run));
+  compact_words[pc.compact_token_word_offset + next_token++] =
+      (nbits << 4u) | (refbits << 8u);
+  if (nbits != 0u) {
+    compact_words[pc.compact_eobrun_word_offset + next_eobrun++] =
+        run - (1u << nbits);
+  }
+}
+
+void CompactRefinementGroupSummary() {
+  uint group = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+  uint block_begin = group * 256u;
+  if (block_begin >= pc.num_blocks) return;
+  uint block_end = min(block_begin + 256u, pc.num_blocks);
+  uint group_blocks = block_end - block_begin;
+  uint first_fixed = group_blocks;
+  uint suffix_tokens = 0u;
+  uint suffix_eobruns = 0u;
+  uint eob_run = 0u;
+  uint eob_refbits = 0u;
+  uint total_refbits = 0u;
+  uint num_nonzeros = 0u;
+  bool in_suffix = false;
+  for (uint block = block_begin; block < block_end; ++block) {
+    uint fixed_tokens =
+        compact_words[pc.compact_scratch_word_offset + block];
+    total_refbits += compact_words[pc.compact_scratch_word_offset +
+                                   pc.num_blocks + block];
+    bool trailing_eob =
+        compact_words[pc.compact_scratch_word_offset +
+                      2u * pc.num_blocks + block] != 0u;
+    uint trailing_refbits = compact_words[pc.compact_scratch_word_offset +
+                                           3u * pc.num_blocks + block];
+    num_nonzeros += compact_words[pc.compact_scratch_word_offset +
+                                  6u * pc.num_blocks + block];
+    if (!in_suffix && fixed_tokens == 0u) continue;
+    if (!in_suffix) {
+      first_fixed = block - block_begin;
+      in_suffix = true;
+    }
+    if (fixed_tokens != 0u) {
+      if (eob_run != 0u) {
+        ++suffix_tokens;
+        if (eob_run >= 2u) ++suffix_eobruns;
+        eob_run = 0u;
+        eob_refbits = 0u;
+      }
+      suffix_tokens += fixed_tokens;
+      if (trailing_eob) {
+        eob_run = 1u;
+        eob_refbits = trailing_refbits;
+      }
+      continue;
+    }
+    if (!trailing_eob) continue;
+    if (eob_run != 0u && eob_refbits + trailing_refbits > 255u) {
+      ++suffix_tokens;
+      if (eob_run >= 2u) ++suffix_eobruns;
+      eob_run = 0u;
+      eob_refbits = 0u;
+    }
+    ++eob_run;
+    eob_refbits += trailing_refbits;
+    if (eob_run == 0x7fffu) {
+      ++suffix_tokens;
+      ++suffix_eobruns;
+      eob_run = 0u;
+      eob_refbits = 0u;
+    }
+  }
+  uint groups = pc.compact_scratch_word_offset + 9u * pc.num_blocks +
+                pc.compact_token_capacity;
+  uint group_base = groups + group * 12u;
+  compact_words[group_base] = first_fixed;
+  compact_words[group_base + 1u] = suffix_tokens;
+  compact_words[group_base + 2u] = suffix_eobruns;
+  compact_words[group_base + 3u] = eob_run;
+  compact_words[group_base + 4u] = eob_refbits;
+  compact_words[group_base + 5u] = total_refbits;
+  compact_words[group_base + 6u] = num_nonzeros;
+}
+
+void CompactRefinementGlobalState() {
+  if (gl_LocalInvocationID.x != 0u) return;
+  uint group_count = (pc.num_blocks + 255u) / 256u;
+  uint groups = pc.compact_scratch_word_offset + 9u * pc.num_blocks +
+                pc.compact_token_capacity;
+  uint next_token = 0u;
+  uint next_refbit = 0u;
+  uint next_eobrun = 0u;
+  uint eob_run = 0u;
+  uint eob_refbits = 0u;
+  uint num_nonzeros = 0u;
+  for (uint group = 0u; group < group_count; ++group) {
+    uint group_base = groups + group * 12u;
+    uint block_begin = group * 256u;
+    uint block_end = min(block_begin + 256u, pc.num_blocks);
+    uint first_fixed = compact_words[group_base];
+    compact_words[group_base + 7u] = next_token;
+    compact_words[group_base + 8u] = next_refbit;
+    compact_words[group_base + 9u] = next_eobrun;
+    compact_words[group_base + 10u] = eob_run;
+    compact_words[group_base + 11u] = eob_refbits;
+
+    uint leading_end = min(block_begin + first_fixed, block_end);
+    for (uint block = block_begin; block < leading_end; ++block) {
+      bool trailing_eob =
+          compact_words[pc.compact_scratch_word_offset +
+                        2u * pc.num_blocks + block] != 0u;
+      if (!trailing_eob) continue;
+      uint trailing_refbits = compact_words[pc.compact_scratch_word_offset +
+                                             3u * pc.num_blocks + block];
+      if (eob_run != 0u && eob_refbits + trailing_refbits > 255u) {
+        ++next_token;
+        if (eob_run >= 2u) ++next_eobrun;
+        eob_run = 0u;
+        eob_refbits = 0u;
+      }
+      ++eob_run;
+      eob_refbits += trailing_refbits;
+      if (eob_run == 0x7fffu) {
+        ++next_token;
+        ++next_eobrun;
+        eob_run = 0u;
+        eob_refbits = 0u;
+      }
+    }
+    if (leading_end < block_end) {
+      if (eob_run != 0u) {
+        ++next_token;
+        if (eob_run >= 2u) ++next_eobrun;
+      }
+      next_token += compact_words[group_base + 1u];
+      next_eobrun += compact_words[group_base + 2u];
+      eob_run = compact_words[group_base + 3u];
+      eob_refbits = compact_words[group_base + 4u];
+    }
+    next_refbit += compact_words[group_base + 5u];
+    num_nonzeros += compact_words[group_base + 6u];
+  }
+  if (eob_run != 0u) {
+    EmitRefinementEob(next_token, next_eobrun, eob_run, eob_refbits);
+  }
+  uint header = pc.compact_header_word_offset;
+  compact_words[header] = next_token;
+  compact_words[header + 1u] = next_refbit;
+  compact_words[header + 2u] = next_eobrun;
+  compact_words[header + 3u] = num_nonzeros;
+  compact_words[header + 4u] =
+      uint(next_token <= pc.compact_token_capacity &&
+           next_refbit <= pc.compact_refbit_capacity);
+}
+
+void CompactRefinementGroupFinalize() {
+  uint group = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+  uint block_begin = group * 256u;
+  if (block_begin >= pc.num_blocks) return;
+  uint block_end = min(block_begin + 256u, pc.num_blocks);
+  uint groups = pc.compact_scratch_word_offset + 9u * pc.num_blocks +
+                pc.compact_token_capacity;
+  uint group_base = groups + group * 12u;
+  uint next_token = compact_words[group_base + 7u];
+  uint next_refbit = compact_words[group_base + 8u];
+  uint next_eobrun = compact_words[group_base + 9u];
+  uint eob_run = compact_words[group_base + 10u];
+  uint eob_refbits = compact_words[group_base + 11u];
+  for (uint block = block_begin; block < block_end; ++block) {
+    uint fixed_tokens =
+        compact_words[pc.compact_scratch_word_offset + block];
+    uint block_refbits = compact_words[pc.compact_scratch_word_offset +
+                                       pc.num_blocks + block];
+    bool trailing_eob =
+        compact_words[pc.compact_scratch_word_offset +
+                      2u * pc.num_blocks + block] != 0u;
+    uint trailing_refbits = compact_words[pc.compact_scratch_word_offset +
+                                           3u * pc.num_blocks + block];
+    compact_words[pc.compact_scratch_word_offset + 5u * pc.num_blocks +
+                  block] = next_refbit;
+    next_refbit += block_refbits;
+    if (fixed_tokens != 0u) {
+      if (eob_run != 0u) {
+        EmitRefinementEob(next_token, next_eobrun, eob_run, eob_refbits);
+        eob_run = 0u;
+        eob_refbits = 0u;
+      }
+      compact_words[pc.compact_scratch_word_offset + 4u * pc.num_blocks +
+                    block] = next_token;
+      next_token += fixed_tokens;
+      if (trailing_eob) {
+        eob_run = 1u;
+        eob_refbits = trailing_refbits;
+      }
+      continue;
+    }
+    compact_words[pc.compact_scratch_word_offset + 4u * pc.num_blocks +
+                  block] = 0xffffffffu;
+    if (!trailing_eob) continue;
+    if (eob_run != 0u && eob_refbits + trailing_refbits > 255u) {
+      EmitRefinementEob(next_token, next_eobrun, eob_run, eob_refbits);
+      eob_run = 0u;
+      eob_refbits = 0u;
+    }
+    ++eob_run;
+    eob_refbits += trailing_refbits;
+    if (eob_run == 0x7fffu) {
+      EmitRefinementEob(next_token, next_eobrun, eob_run, eob_refbits);
+      eob_run = 0u;
+      eob_refbits = 0u;
+    }
+  }
+}
+
+void ScatterRefinementBlock(uint block, uint lane, uint num_blocks,
+                            uint compact_token_word_offset,
+                            uint compact_refbit_word_offset,
+                            uint compact_scratch_word_offset,
+                            uint compact_scratch_stride_words) {
+  uint local_tokens = compact_scratch_word_offset + num_blocks * 9u +
+                      block * compact_scratch_stride_words;
+  uint fixed_tokens = compact_words[compact_scratch_word_offset + block];
+  uint token_output = compact_words[compact_scratch_word_offset +
+                                      4u * num_blocks + block];
+  if (token_output != 0xffffffffu) {
+    for (uint i = 0u; i < fixed_tokens; ++i) {
+      compact_words[compact_token_word_offset + token_output + i] =
+          compact_words[local_tokens + i];
+    }
+  }
+  uint refbit_count = compact_words[compact_scratch_word_offset + num_blocks +
+                                     block];
+  uint refbit_output = compact_words[compact_scratch_word_offset +
+                                      5u * num_blocks + block];
+  uint refbits_low = compact_words[compact_scratch_word_offset +
+                                    7u * num_blocks + block];
+  uint refbits_high = compact_words[compact_scratch_word_offset +
+                                     8u * num_blocks + block];
+  for (uint i = 0u; i < refbit_count; ++i) {
+    uint bit = i < 32u ? ((refbits_low >> i) & 1u)
+                       : ((refbits_high >> (i - 32u)) & 1u);
+    compact_words[compact_refbit_word_offset + refbit_output + i] = bit;
+  }
+}
+
 void EmitScanDescriptor(uint block, uint lane, int coefficient,
                         uint spectral_start, uint spectral_end,
                         uint successive_low, uint output_stride_words,
-                        uint context, uint mode, uint output_word_offset) {
+                        uint context, uint mode, uint output_word_offset,
+                        uint num_blocks, uint compact_enabled,
+                        uint compact_scratch_word_offset,
+                        uint compact_scratch_stride_words) {
   bool in_band = lane >= spectral_start && lane <= spectral_end;
   uint output_base = output_word_offset + block * output_stride_words;
   if (mode == 1u) {
@@ -66,14 +597,28 @@ void EmitScanDescriptor(uint block, uint lane, int coefficient,
       uint packed_event = lane | (uint(existing) << 8u) |
                           ((uint(magnitude) & 1u) << 9u) |
                           (uint(sign_mask == 0) << 10u);
-      descriptor_words[output_base + 2u + event_rank] = packed_event;
+      if (compact_enabled != 0u) {
+        active_positions[event_rank] = packed_event;
+      } else {
+        descriptor_words[output_base + 2u + event_rank] = packed_event;
+      }
     }
-    if (lane == 0u) {
+    if (lane == 0u && compact_enabled == 0u) {
       descriptor_words[output_base] = event_count;
       descriptor_words[output_base + 1u] = new_count;
     }
-    // Throughput mode can immediately reuse shared scratch for the next scan.
     barrier();
+    if (compact_enabled != 0u) {
+      if (lane == 0u) {
+        PrepareRefinementBlock(
+            block, num_blocks, spectral_start, spectral_end,
+            output_stride_words, output_word_offset,
+            compact_scratch_word_offset, compact_scratch_stride_words,
+            event_count, true);
+      }
+      // Do not let the next fused scan overwrite shared event storage early.
+      barrier();
+    }
     return;
   }
 
@@ -130,19 +675,99 @@ void EmitScanDescriptor(uint block, uint lane, int coefficient,
     descriptor_words[output_base + 1u] =
         active_count | (future_count << 8u) |
         (uint(trailing_eob) << 16u);
+    if (compact_enabled != 0u) {
+      uint scratch = compact_scratch_word_offset +
+                     block * compact_scratch_stride_words;
+      compact_words[scratch] = token_count;
+      compact_words[scratch + 1u] = descriptor_words[output_base + 1u];
+    }
   }
   // Keep shared active_positions live until every lane has finished this scan.
   barrier();
 }
 
 void main() {
+  if (pc.mode == 2u) {
+    CompactInitialGroupSummary();
+    return;
+  }
+  if (pc.mode == 6u) {
+    CompactRefinementGroupSummary();
+    return;
+  }
+  if (pc.mode == 10u) {
+    CompactInitialGlobalState();
+    return;
+  }
+  if (pc.mode == 11u) {
+    CompactInitialGroupFinalize();
+    return;
+  }
+  if (pc.mode == 12u) {
+    CompactRefinementGlobalState();
+    return;
+  }
+  if (pc.mode == 13u) {
+    CompactRefinementGroupFinalize();
+    return;
+  }
+
+  uint lane = gl_LocalInvocationID.x;
+  if (pc.mode == 8u || pc.mode == 9u) {
+    uint compact_group =
+        gl_WorkGroupID.x + gl_WorkGroupID.y * pc.dispatch_width;
+    uint compact_block = compact_group * 64u + lane;
+    if (compact_block >= pc.num_blocks) return;
+    for (uint scan = 0u; scan < pc.scan_parameter_count; ++scan) {
+      uint parameter = (pc.scan_parameter_offset + scan) * 20u;
+      if (scan_parameter_words[parameter + 8u] == 0u ||
+          compact_block >= scan_parameter_words[parameter]) {
+        continue;
+      }
+      uint scan_mode = scan_parameter_words[parameter + 6u];
+      if (pc.mode == 8u) {
+        if (scan_mode == 0u) {
+          PrepareInitialBlock(
+              compact_block, scan_parameter_words[parameter + 4u],
+              scan_parameter_words[parameter + 7u],
+              scan_parameter_words[parameter + 13u],
+              scan_parameter_words[parameter + 14u]);
+        } else {
+          PrepareRefinementBlock(
+              compact_block, scan_parameter_words[parameter],
+              scan_parameter_words[parameter + 1u],
+              scan_parameter_words[parameter + 2u],
+              scan_parameter_words[parameter + 4u],
+              scan_parameter_words[parameter + 7u],
+              scan_parameter_words[parameter + 13u],
+              scan_parameter_words[parameter + 14u], 0u, false);
+        }
+      } else if (scan_mode == 0u) {
+        ScatterInitialBlock(
+            compact_block, lane, scan_parameter_words[parameter + 4u],
+            scan_parameter_words[parameter + 7u],
+            scan_parameter_words[parameter + 10u],
+            scan_parameter_words[parameter + 13u],
+            scan_parameter_words[parameter + 14u]);
+      } else {
+        ScatterRefinementBlock(
+            compact_block, lane, scan_parameter_words[parameter],
+            scan_parameter_words[parameter + 10u],
+            scan_parameter_words[parameter + 11u],
+            scan_parameter_words[parameter + 13u],
+            scan_parameter_words[parameter + 14u]);
+      }
+    }
+    return;
+  }
+
   uint block = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.dispatch_width;
   if (block >= pc.num_blocks) return;
-  uint lane = gl_LocalInvocationID.x;
+
   int coefficient = LoadCoefficient(block, lane);
   if (pc.mode == 4u) {
     for (uint scan = 0u; scan < pc.scan_parameter_count; ++scan) {
-      uint parameter = (pc.scan_parameter_offset + scan) * 8u;
+      uint parameter = (pc.scan_parameter_offset + scan) * 20u;
       EmitScanDescriptor(
           block, lane, coefficient,
           scan_parameter_words[parameter + 1u],
@@ -151,12 +776,21 @@ void main() {
           scan_parameter_words[parameter + 4u],
           scan_parameter_words[parameter + 5u],
           scan_parameter_words[parameter + 6u],
-          scan_parameter_words[parameter + 7u]);
+          scan_parameter_words[parameter + 7u],
+          scan_parameter_words[parameter],
+          scan_parameter_words[parameter + 8u],
+          scan_parameter_words[parameter + 13u],
+          scan_parameter_words[parameter + 14u]);
+    }
+    if (pc.compact_token_capacity != 0u) {
+      EmitProgressiveDC(block, lane, coefficient);
     }
     return;
   }
   EmitScanDescriptor(block, lane, coefficient, pc.spectral_start,
                      pc.spectral_end, pc.successive_low,
                      pc.output_stride_words, pc.context, pc.mode,
-                     pc.output_word_offset);
+                     pc.output_word_offset, pc.num_blocks, 0u,
+                     pc.compact_scratch_word_offset,
+                     pc.compact_scratch_stride_words);
 }

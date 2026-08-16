@@ -13,6 +13,10 @@ namespace jpegli {
 
 void ComputeCoefficientsForiMCURow(j_compress_ptr cinfo);
 
+// Materializes coefficient arrays from the retained AMD front-end planes if a
+// Vulkan submit fails before tokenization. This is a cold failure path.
+void ComputeAmdVulkanFrontendCoefficients(j_compress_ptr cinfo);
+
 void ComputeTokensForiMCURow(j_compress_ptr cinfo);
 
 void WriteiMCURow(j_compress_ptr cinfo);

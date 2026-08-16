@@ -1,0 +1,197 @@
+#version 460
+
+// Latency-oriented DCT and quantization front end for AMD UMA GPUs. One
+// wave64 owns one 8x8 block, so both separable DCT passes and coefficient
+// packing stay inside a workgroup. The small stateful DC zero-bias recurrence
+// is supplied by the CPU while it retains the downsampled planes.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer CoefficientBuffer {
+  uint coefficient_words[];
+};
+
+layout(set = 0, binding = 4, std430) buffer FrontendBuffer {
+  float frontend_values[];
+};
+
+layout(push_constant) uniform FrontendPushConstants {
+  uint coefficient_word_offset;
+  uint num_blocks;
+  uint plane_float_offset;
+  uint plane_stride;
+  uint width_blocks;
+  uint height_blocks;
+  uint quant_field_float_offset;
+  uint quant_field_stride;
+  uint quant_mul_float_offset;
+  uint zero_bias_offset_float_offset;
+  uint zero_bias_mul_float_offset;
+  uint dc_float_offset;
+  uint dispatch_width;
+  uint mode;
+  uint h_factor;
+  uint max_v_samp_factor;
+  uint xsize_mcus;
+  uint h_samp_factor;
+  uint v_samp_factor;
+  uint adaptive_quant;
+} pc;
+
+// Eight 8-lane block teams fill one wave64. This keeps all lanes occupied in
+// both DCT passes while retaining workgroup-local synchronization.
+shared float dct_stage[8 * 64];
+shared int quantized[8 * 64];
+
+const uint kNaturalOrder[64] = uint[64](
+    0u, 1u, 8u, 16u, 9u, 2u, 3u, 10u,
+    17u, 24u, 32u, 25u, 18u, 11u, 4u, 5u,
+    12u, 19u, 26u, 33u, 40u, 48u, 41u, 34u,
+    27u, 20u, 13u, 6u, 7u, 14u, 21u, 28u,
+    35u, 42u, 49u, 56u, 57u, 50u, 43u, 36u,
+    29u, 22u, 15u, 23u, 30u, 37u, 44u, 51u,
+    58u, 59u, 52u, 45u, 38u, 31u, 39u, 46u,
+    53u, 60u, 61u, 54u, 47u, 55u, 62u, 63u);
+
+void Dct4(in float input_value[4], out float output_value[4]) {
+  precise float e0_input = input_value[0] + input_value[3];
+  precise float e1_input = input_value[1] + input_value[2];
+  precise float even0 = e0_input + e1_input;
+  precise float even1 = e0_input - e1_input;
+
+  precise float o0_input = input_value[0] - input_value[3];
+  precise float o1_input = input_value[1] - input_value[2];
+  precise float o1_scaled = o1_input * 1.3065629648763764f;
+  // GCC contracts jpegli's stored multiply followed by the recursive add or
+  // subtract on AVX2/AVX3. Spell out that exact rounding point on the GPU.
+  precise float odd0 = fma(o0_input, 0.541196100146197f, o1_scaled);
+  precise float odd1 = fma(o0_input, 0.541196100146197f, -o1_scaled);
+  precise float b0 = fma(odd0, 1.41421356237f, odd1);
+
+  output_value[0] = even0;
+  output_value[1] = b0;
+  output_value[2] = even1;
+  output_value[3] = odd1;
+}
+
+void Dct8(in float input_value[8], out float output_value[8]) {
+  precise float even_input[4];
+  precise float even_value[4];
+  precise float odd_value[4];
+  even_input[0] = input_value[0] + input_value[7];
+  even_input[1] = input_value[1] + input_value[6];
+  even_input[2] = input_value[2] + input_value[5];
+  even_input[3] = input_value[3] + input_value[4];
+  Dct4(even_input, even_value);
+
+  precise float d0 = input_value[0] - input_value[7];
+  precise float d1 = input_value[1] - input_value[6];
+  precise float d2 = input_value[2] - input_value[5];
+  precise float d3 = input_value[3] - input_value[4];
+  precise float scaled2 = d2 * 0.8999762231364156f;
+  precise float scaled3 = d3 * 2.5629154477415055f;
+  precise float pair03_sum = fma(d0, 0.5097955791041592f, scaled3);
+  precise float pair03_difference =
+      fma(d0, 0.5097955791041592f, -scaled3);
+  precise float pair12_sum = fma(d1, 0.6013448869350453f, scaled2);
+  precise float pair12_difference =
+      fma(d1, 0.6013448869350453f, -scaled2);
+  odd_value[0] = pair03_sum + pair12_sum;
+  odd_value[2] = pair03_sum - pair12_sum;
+  precise float scaled_difference1 =
+      pair12_difference * 1.3065629648763764f;
+  precise float inner_odd0 =
+      fma(pair03_difference, 0.541196100146197f, scaled_difference1);
+  odd_value[3] =
+      fma(pair03_difference, 0.541196100146197f, -scaled_difference1);
+  odd_value[1] = fma(inner_odd0, 1.41421356237f, odd_value[3]);
+  precise float odd0 = fma(odd_value[0], 1.41421356237f, odd_value[1]);
+  precise float odd1 = odd_value[1] + odd_value[2];
+  precise float odd2 = odd_value[2] + odd_value[3];
+
+  output_value[0] = even_value[0];
+  output_value[1] = odd0;
+  output_value[2] = even_value[1];
+  output_value[3] = odd1;
+  output_value[4] = even_value[2];
+  output_value[5] = odd2;
+  output_value[6] = even_value[3];
+  output_value[7] = odd_value[3];
+}
+
+float AdaptiveQuantStrength(uint by, uint bx) {
+  if (pc.adaptive_quant == 0u) return 0.0f;
+  uint mcu_y = by / pc.v_samp_factor;
+  uint iy = by - mcu_y * pc.v_samp_factor;
+  uint qf_y = mcu_y * pc.max_v_samp_factor + iy;
+  return frontend_values[pc.quant_field_float_offset +
+                         qf_y * pc.quant_field_stride + bx * pc.h_factor];
+}
+
+void TransformAndQuantize(uint block, uint block_in_wave, uint lane,
+                          bool valid) {
+  uint shared_offset = block_in_wave * 64u;
+  uint by = block / pc.width_blocks;
+  uint bx = block - by * pc.width_blocks;
+  precise float input_value[8];
+  precise float output_value[8];
+  for (uint y = 0u; y < 8u; ++y) {
+    input_value[y] =
+        valid ? frontend_values[
+                    pc.plane_float_offset +
+                    (by * 8u + y) * pc.plane_stride + bx * 8u + lane]
+              : 0.0f;
+  }
+  Dct8(input_value, output_value);
+  for (uint k = 0u; k < 8u; ++k) {
+    dct_stage[shared_offset + k * 8u + lane] = output_value[k] * 0.125f;
+  }
+  barrier();
+
+  for (uint x = 0u; x < 8u; ++x) {
+    input_value[x] = dct_stage[shared_offset + lane * 8u + x];
+  }
+  Dct8(input_value, output_value);
+  for (uint k = 0u; k < 8u; ++k) {
+    dct_stage[shared_offset + lane * 8u + k] =
+        output_value[k] * 0.125f;
+  }
+  barrier();
+
+  float aq_strength = valid ? AdaptiveQuantStrength(by, bx) : 0.0f;
+  for (uint coefficient = lane; coefficient < 64u; coefficient += 8u) {
+    precise float qval =
+        dct_stage[shared_offset + coefficient] *
+        frontend_values[pc.quant_mul_float_offset + coefficient];
+    precise float threshold =
+        fma(aq_strength,
+            frontend_values[pc.zero_bias_mul_float_offset + coefficient],
+            frontend_values[pc.zero_bias_offset_float_offset + coefficient]);
+    quantized[shared_offset + coefficient] =
+        abs(qval) >= threshold ? int(roundEven(qval)) : 0;
+  }
+  barrier();
+
+  for (uint word = lane; valid && word < 32u; word += 8u) {
+    uint zigzag0 = word * 2u;
+    uint zigzag1 = zigzag0 + 1u;
+    uint low =
+        uint(quantized[shared_offset + kNaturalOrder[zigzag0]]) & 0xffffu;
+    uint high =
+        uint(quantized[shared_offset + kNaturalOrder[zigzag1]]) & 0xffffu;
+    if (word == 0u) {
+      low = uint(int(frontend_values[pc.dc_float_offset + block])) & 0xffffu;
+    }
+    coefficient_words[pc.coefficient_word_offset + block * 32u + word] =
+        low | (high << 16u);
+  }
+}
+
+void main() {
+  uint lane = gl_LocalInvocationID.x;
+  uint group = gl_WorkGroupID.y * pc.dispatch_width + gl_WorkGroupID.x;
+  uint block_in_wave = lane / 8u;
+  uint lane_in_block = lane & 7u;
+  uint block = group * 8u + block_in_wave;
+  TransformAndQuantize(block, block_in_wave, lane_in_block,
+                       block < pc.num_blocks);
+}

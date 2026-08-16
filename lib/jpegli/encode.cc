@@ -7,6 +7,8 @@
 #include "lib/jpegli/encode.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -409,6 +411,11 @@ bool IsStreamingSupported(j_compress_ptr cinfo) {
 void AllocateBuffers(j_compress_ptr cinfo) {
   jpeg_comp_master* m = cinfo->master;
   memset(m->last_dc_coeff, 0, sizeof(m->last_dc_coeff));
+  memset(m->amd_vulkan_last_dc, 0, sizeof(m->amd_vulkan_last_dc));
+  m->amd_vulkan_frontend = false;
+  m->amd_vulkan_trace = false;
+  m->amd_vulkan_plane_capture_ns = 0;
+  m->amd_vulkan_dc_ns = 0;
   if (!IsStreamingSupported(cinfo) || cinfo->optimize_coding) {
     int ysize_blocks = DivCeil(cinfo->image_height, DCTSIZE);
     int num_arrays = cinfo->num_scans * ysize_blocks;
@@ -525,6 +532,9 @@ void InitCompress(j_compress_ptr cinfo, boolean write_all_tables) {
     QuantPass pass = m->psnr_target > 0 ? QuantPass::SEARCH_FIRST_PASS
                                         : QuantPass::NO_SEARCH;
     InitQuantizer(cinfo, pass);
+    if (pass == QuantPass::NO_SEARCH) {
+      m->amd_vulkan_frontend = AmdVulkanFrontendPrepare(cinfo);
+    }
   }
   if (write_all_tables) {
     jpegli_suppress_tables(cinfo, FALSE);
@@ -612,7 +622,98 @@ void ProcessiMCURow(j_compress_ptr cinfo) {
       WriteiMCURow(cinfo);
     }
   } else {
-    ComputeCoefficientsForiMCURow(cinfo);
+    jpeg_comp_master* m = cinfo->master;
+    if (m->amd_vulkan_frontend) {
+      const auto capture_start = m->amd_vulkan_trace
+                                     ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+      const size_t mcu_y = m->next_iMCU_row;
+      for (int c = 0; c < cinfo->num_components; ++c) {
+        const jpeg_component_info& comp = cinfo->comp_info[c];
+        const size_t y0 = mcu_y * comp.v_samp_factor * DCTSIZE;
+        const size_t rows = std::min<size_t>(
+            comp.v_samp_factor * DCTSIZE, comp.height_in_blocks * DCTSIZE - y0);
+        const size_t row_bytes =
+            static_cast<size_t>(comp.width_in_blocks) * DCTSIZE * sizeof(float);
+        for (size_t y = 0; y < rows; ++y) {
+          memcpy(m->amd_vulkan_planes[c] +
+                     (y0 + y) * m->amd_vulkan_plane_stride[c],
+                 m->raw_data[c]->Row(y0 + y), row_bytes);
+        }
+      }
+      const size_t qf_y0 = mcu_y * cinfo->max_v_samp_factor;
+      const size_t qf_rows =
+          std::min<size_t>(cinfo->max_v_samp_factor, m->ysize_blocks - qf_y0);
+      for (size_t y = 0; y < qf_rows; ++y) {
+        memcpy(m->amd_vulkan_quant_field + (qf_y0 + y) * m->xsize_blocks,
+               m->quant_field.Row(y), m->xsize_blocks * sizeof(float));
+      }
+      const auto dc_start = m->amd_vulkan_trace
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+      const int xsize_mcus =
+          DivCeil(cinfo->image_width, DCTSIZE * cinfo->max_h_samp_factor);
+      for (int mcu_x = 0; mcu_x < xsize_mcus; ++mcu_x) {
+        for (int c = 0; c < cinfo->num_components; ++c) {
+          const jpeg_component_info& comp = cinfo->comp_info[c];
+          const size_t stride = m->raw_data[c]->stride();
+          const float* imcu_start =
+              m->raw_data[c]->Row(mcu_y * comp.v_samp_factor * DCTSIZE);
+          for (int iy = 0; iy < comp.v_samp_factor; ++iy) {
+            for (int ix = 0; ix < comp.h_samp_factor; ++ix) {
+              const size_t by = mcu_y * comp.v_samp_factor + iy;
+              const size_t bx = mcu_x * comp.h_samp_factor + ix;
+              if (by >= comp.height_in_blocks || bx >= comp.width_in_blocks) {
+                continue;
+              }
+              const float* pixels = imcu_start + (iy * stride + bx) * DCTSIZE;
+              float column_dc[DCTSIZE];
+              for (int x = 0; x < DCTSIZE; ++x) {
+                const float even0 = pixels[x] + pixels[7 * stride + x];
+                const float even1 = pixels[stride + x] + pixels[6 * stride + x];
+                const float even2 =
+                    pixels[2 * stride + x] + pixels[5 * stride + x];
+                const float even3 =
+                    pixels[3 * stride + x] + pixels[4 * stride + x];
+                column_dc[x] = ((even0 + even3) + (even1 + even2)) * 0.125f;
+              }
+              const float even0 = column_dc[0] + column_dc[7];
+              const float even1 = column_dc[1] + column_dc[6];
+              const float even2 = column_dc[2] + column_dc[5];
+              const float even3 = column_dc[3] + column_dc[4];
+              const float dct_dc = ((even0 + even3) + (even1 + even2)) * 0.125f;
+              const float dc = (dct_dc - 128.0f) * m->quant_mul[c][0];
+              const float aq_strength =
+                  m->use_adaptive_quantization
+                      ? m->quant_field.Row(iy)[bx * m->h_factor[c]]
+                      : 0.0f;
+              const float threshold = m->zero_bias_offset[c][0] +
+                                      aq_strength * m->zero_bias_mul[c][0];
+              const int last_dc = m->amd_vulkan_last_dc[c];
+              const int value = std::abs(dc - last_dc) < threshold
+                                    ? last_dc
+                                    : static_cast<int>(std::round(dc));
+              m->amd_vulkan_dc_coefficients[c][by * comp.width_in_blocks + bx] =
+                  static_cast<float>(value);
+              m->amd_vulkan_last_dc[c] = value;
+            }
+          }
+        }
+      }
+      if (m->amd_vulkan_trace) {
+        const auto dc_end = std::chrono::steady_clock::now();
+        m->amd_vulkan_plane_capture_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(dc_start -
+                                                                 capture_start)
+                .count();
+        m->amd_vulkan_dc_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(dc_end -
+                                                                 dc_start)
+                .count();
+      }
+    } else {
+      ComputeCoefficientsForiMCURow(cinfo);
+    }
   }
   ++cinfo->master->next_iMCU_row;
 }
@@ -699,6 +800,17 @@ void jpegli_CreateCompress(j_compress_ptr cinfo, int version,
   cinfo->master->data_type = JPEGLI_TYPE_UINT8;
   cinfo->master->endianness = JPEGLI_NATIVE_ENDIAN;
   cinfo->master->coeff_buffers = nullptr;
+  cinfo->master->amd_vulkan_frontend = false;
+  cinfo->master->amd_vulkan_quant_field = nullptr;
+  cinfo->master->amd_vulkan_trace = false;
+  cinfo->master->amd_vulkan_plane_capture_ns = 0;
+  cinfo->master->amd_vulkan_dc_ns = 0;
+  for (int c = 0; c < jpegli::kMaxComponents; ++c) {
+    cinfo->master->amd_vulkan_planes[c] = nullptr;
+    cinfo->master->amd_vulkan_plane_stride[c] = 0;
+    cinfo->master->amd_vulkan_dc_coefficients[c] = nullptr;
+    cinfo->master->amd_vulkan_last_dc[c] = 0;
+  }
 }
 
 void jpegli_set_xyb_mode(j_compress_ptr cinfo) {

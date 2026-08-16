@@ -23,6 +23,7 @@
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/encode_internal.h"
+#include "lib/jpegli/encode_streaming.h"
 #include "lib/jpegli/error.h"
 #include "lib/jpegli/huffman.h"
 #include "lib/jpegli/memory_manager.h"
@@ -96,12 +97,201 @@ void TokenizeProgressiveDC(const coeff_t* coeffs, int context, int Al,
   *(*next_token)++ = Token(context, nbits, bits);
 }
 
+bool ConsumeCompactedInitialAC(j_compress_ptr cinfo, int scan_index,
+                               const AmdVulkanACResult& gpu,
+                               ScanTokenInfo* sti) {
+  if (gpu.compact_header == nullptr || gpu.compact_tokens == nullptr ||
+      sti->restart_interval != 0 || gpu.compact_header[3] != 1) {
+    return false;
+  }
+  static_assert(sizeof(Token) == sizeof(uint32_t),
+                "GPU compact Token ABI changed");
+  static_assert(offsetof(Token, context) == 0 && offsetof(Token, symbol) == 1 &&
+                    offsetof(Token, bits) == 2,
+                "GPU compact Token layout changed");
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+  static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+                "AMD compact token path requires little endian");
+#endif
+  const jpeg_scan_info& scan = cinfo->scan_info[scan_index];
+  const size_t band_size = static_cast<size_t>(scan.Se - scan.Ss + 1);
+  if (gpu.num_blocks > std::numeric_limits<size_t>::max() / (band_size + 1)) {
+    return false;
+  }
+  const size_t max_tokens = gpu.num_blocks * (band_size + 1);
+  const size_t token_count = gpu.compact_header[0];
+  const size_t num_nonzeros = gpu.compact_header[1];
+  const size_t num_future_nonzeros = gpu.compact_header[2];
+  if (token_count > max_tokens || num_nonzeros > gpu.num_blocks * band_size ||
+      num_future_nonzeros > gpu.num_blocks * band_size) {
+    return false;
+  }
+
+  const auto consume_start = std::chrono::steady_clock::now();
+  jpeg_comp_master* m = cinfo->master;
+  TokenArray* ta = &m->token_arrays[m->cur_token_array];
+  sti->token_offset = m->total_num_tokens + ta->num_tokens;
+  sti->restarts = Allocate<size_t>(cinfo, 1, JPOOL_IMAGE);
+  const size_t available =
+      ta->num_tokens <= m->num_tokens ? m->num_tokens - ta->num_tokens : 0;
+  if (token_count > available) {
+    if (ta->tokens != nullptr) {
+      m->total_num_tokens += ta->num_tokens;
+      ++m->cur_token_array;
+      ta = &m->token_arrays[m->cur_token_array];
+    }
+    m->num_tokens = token_count;
+    ta->tokens = Allocate<Token>(cinfo, m->num_tokens, JPOOL_IMAGE);
+    m->next_token = ta->tokens;
+  }
+  if (token_count != 0) {
+    memcpy(static_cast<void*>(m->next_token),
+           static_cast<const void*>(gpu.compact_tokens),
+           token_count * sizeof(Token));
+    m->next_token += token_count;
+  }
+  ta->num_tokens = m->next_token - ta->tokens;
+  sti->num_tokens = token_count;
+  sti->num_nonzeros += num_nonzeros;
+  sti->num_future_nonzeros += num_future_nonzeros;
+  sti->restarts[0] = m->total_num_tokens + ta->num_tokens;
+
+  const char* trace = std::getenv("JPEGLI_AMD_VULKAN_TRACE");
+  if (trace != nullptr && strcmp(trace, "0") != 0) {
+    const double milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - consume_start)
+            .count();
+    fprintf(stderr,
+            "jpegli amd-vulkan: consumed compact initial AC scan %d in "
+            "%.3f ms\n",
+            scan_index, milliseconds);
+  }
+  return true;
+}
+
+bool ConsumeCompactedRefinementAC(j_compress_ptr cinfo, int scan_index,
+                                  const AmdVulkanACResult& gpu,
+                                  ScanTokenInfo* sti) {
+  if (gpu.compact_header == nullptr || gpu.compact_tokens == nullptr ||
+      gpu.compact_refbits == nullptr || gpu.compact_eobruns == nullptr ||
+      sti->restart_interval != 0 || gpu.compact_header[4] != 1) {
+    return false;
+  }
+  const jpeg_scan_info& scan = cinfo->scan_info[scan_index];
+  const size_t band_size = static_cast<size_t>(scan.Se - scan.Ss + 1);
+  const size_t max_tokens_per_block = band_size + (band_size + 15) / 16 + 1;
+  if (gpu.num_blocks >
+          std::numeric_limits<size_t>::max() / max_tokens_per_block ||
+      gpu.num_blocks > std::numeric_limits<size_t>::max() / band_size) {
+    return false;
+  }
+  const size_t token_count = gpu.compact_header[0];
+  const size_t refbit_count = gpu.compact_header[1];
+  const size_t eobrun_count = gpu.compact_header[2];
+  const size_t num_nonzeros = gpu.compact_header[3];
+  if (token_count > gpu.num_blocks * max_tokens_per_block ||
+      refbit_count > gpu.num_blocks * band_size ||
+      eobrun_count > gpu.num_blocks / 2 + 1 ||
+      num_nonzeros > gpu.num_blocks * band_size) {
+    return false;
+  }
+
+  const auto consume_start = std::chrono::steady_clock::now();
+  jpeg_comp_master* m = cinfo->master;
+  sti->tokens = m->next_refinement_token;
+  sti->refbits = m->next_refinement_bit;
+  sti->eobruns = Allocate<uint16_t>(cinfo, gpu.num_blocks / 2 + 1, JPOOL_IMAGE);
+  sti->restarts = Allocate<size_t>(cinfo, 1, JPOOL_IMAGE);
+  for (size_t i = 0; i < token_count; ++i) {
+    const uint32_t packed = gpu.compact_tokens[i];
+    sti->tokens[i].symbol = packed & 0xffu;
+    sti->tokens[i].refbits = (packed >> 8u) & 0xffu;
+  }
+  for (size_t i = 0; i < refbit_count; ++i) {
+    sti->refbits[i] = gpu.compact_refbits[i] & 1u;
+  }
+  for (size_t i = 0; i < eobrun_count; ++i) {
+    sti->eobruns[i] = gpu.compact_eobruns[i];
+  }
+  sti->num_tokens = token_count;
+  sti->num_nonzeros += num_nonzeros;
+  sti->restarts[0] = token_count;
+  m->next_refinement_token += token_count;
+  m->next_refinement_bit += refbit_count;
+
+  const char* trace = std::getenv("JPEGLI_AMD_VULKAN_TRACE");
+  if (trace != nullptr && strcmp(trace, "0") != 0) {
+    const double milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - consume_start)
+            .count();
+    fprintf(stderr,
+            "jpegli amd-vulkan: consumed compact refinement AC scan %d in "
+            "%.3f ms\n",
+            scan_index, milliseconds);
+  }
+  return true;
+}
+
+bool TokenizeProgressiveDCAmdVulkan(j_compress_ptr cinfo, int scan_index,
+                                    ScanTokenInfo* sti) {
+  AmdVulkanACResult gpu;
+  if (!AmdVulkanTokenizeDC(cinfo, scan_index, &gpu) ||
+      gpu.compact_header == nullptr || gpu.compact_header[2] != 1 ||
+      gpu.compact_header[0] != gpu.num_blocks ||
+      gpu.num_blocks != sti->num_blocks || sti->restart_interval != 0) {
+    return false;
+  }
+  static_assert(sizeof(Token) == sizeof(uint32_t),
+                "GPU progressive-DC Token ABI changed");
+  const auto consume_start = std::chrono::steady_clock::now();
+  jpeg_comp_master* m = cinfo->master;
+  TokenArray* ta = &m->token_arrays[m->cur_token_array];
+  sti->token_offset = m->total_num_tokens + ta->num_tokens;
+  const size_t available =
+      ta->num_tokens <= m->num_tokens ? m->num_tokens - ta->num_tokens : 0;
+  if (gpu.num_blocks > available) {
+    if (ta->tokens != nullptr) {
+      m->total_num_tokens += ta->num_tokens;
+      ++m->cur_token_array;
+      ta = &m->token_arrays[m->cur_token_array];
+    }
+    m->num_tokens = gpu.num_blocks;
+    ta->tokens = Allocate<Token>(cinfo, m->num_tokens, JPOOL_IMAGE);
+    m->next_token = ta->tokens;
+  }
+  memcpy(static_cast<void*>(m->next_token),
+         static_cast<const void*>(gpu.compact_tokens),
+         gpu.num_blocks * sizeof(Token));
+  m->next_token += gpu.num_blocks;
+  ta->num_tokens = m->next_token - ta->tokens;
+  sti->num_tokens = gpu.num_blocks;
+  sti->restarts[0] = m->total_num_tokens + ta->num_tokens;
+  sti->symbol_histogram = Allocate<uint32_t>(cinfo, 256, JPOOL_IMAGE);
+  memcpy(sti->symbol_histogram, gpu.symbol_histogram, 256 * sizeof(uint32_t));
+
+  const char* trace = std::getenv("JPEGLI_AMD_VULKAN_TRACE");
+  if (trace != nullptr && strcmp(trace, "0") != 0) {
+    const double milliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - consume_start)
+            .count();
+    fprintf(stderr,
+            "jpegli amd-vulkan: consumed progressive DC scan %d in %.3f "
+            "ms\n",
+            scan_index, milliseconds);
+  }
+  return true;
+}
+
 bool TokenizeACProgressiveScanAmdVulkan(j_compress_ptr cinfo, int scan_index,
                                         int context, ScanTokenInfo* sti) {
   AmdVulkanACResult gpu;
   if (!AmdVulkanTokenizeInitialAC(cinfo, scan_index, context, &gpu)) {
     return false;
   }
+  if (ConsumeCompactedInitialAC(cinfo, scan_index, gpu, sti)) return true;
   const auto stitch_start = std::chrono::steady_clock::now();
 
   jpeg_comp_master* m = cinfo->master;
@@ -305,6 +495,7 @@ bool TokenizeACRefinementScanAmdVulkan(j_compress_ptr cinfo, int scan_index,
   if (!AmdVulkanTokenizeRefinementAC(cinfo, scan_index, &gpu)) {
     return false;
   }
+  if (ConsumeCompactedRefinementAC(cinfo, scan_index, gpu, sti)) return true;
   const auto stitch_start = std::chrono::steady_clock::now();
 
   jpeg_comp_master* m = cinfo->master;
@@ -554,6 +745,10 @@ void TokenizeScan(j_compress_ptr cinfo, size_t scan_index, int ac_ctx_offset,
     }
     return;
   }
+  if (cinfo->progressive_mode && scan_info->Ah == 0 &&
+      TokenizeProgressiveDCAmdVulkan(cinfo, scan_index, sti)) {
+    return;
+  }
 
   jpeg_comp_master* m = cinfo->master;
   size_t restart_interval = sti->restart_interval;
@@ -680,6 +875,10 @@ void TokenizeJpeg(j_compress_ptr cinfo) {
   jpeg_comp_master* m = cinfo->master;
   const bool amd_vulkan_active =
       cinfo->progressive_mode && AmdVulkanProgressiveBegin(cinfo);
+  if (m->amd_vulkan_frontend && !amd_vulkan_active) {
+    ComputeAmdVulkanFrontendCoefficients(cinfo);
+    m->amd_vulkan_frontend = false;
+  }
   std::vector<int> processed(cinfo->num_scans);
   size_t max_refinement_tokens = 0;
   size_t num_refinement_bits = 0;
@@ -753,12 +952,27 @@ struct Histogram {
 
 void BuildHistograms(j_compress_ptr cinfo, Histogram* histograms) {
   jpeg_comp_master* m = cinfo->master;
+  bool gpu_dc_histogram[kMaxComponents] = {};
+  for (int i = 0; i < cinfo->num_scans; ++i) {
+    const jpeg_scan_info& si = cinfo->scan_info[i];
+    const ScanTokenInfo& sti = m->scan_token_info[i];
+    if (si.Ss != 0 || si.Ah != 0 || si.comps_in_scan != 1 ||
+        sti.symbol_histogram == nullptr) {
+      continue;
+    }
+    const int context = si.component_index[0];
+    for (size_t symbol = 0; symbol < 256; ++symbol) {
+      histograms[context].count[symbol] += sti.symbol_histogram[symbol];
+    }
+    gpu_dc_histogram[context] = true;
+  }
   size_t num_token_arrays = m->cur_token_array + 1;
   for (size_t i = 0; i < num_token_arrays; ++i) {
     Token* tokens = m->token_arrays[i].tokens;
     size_t num_tokens = m->token_arrays[i].num_tokens;
     for (size_t j = 0; j < num_tokens; ++j) {
       Token t = tokens[j];
+      if (t.context < kMaxComponents && gpu_dc_histogram[t.context]) continue;
       ++histograms[t.context].count[t.symbol];
     }
   }

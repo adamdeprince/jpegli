@@ -62,6 +62,7 @@ struct ScanTokenInfo {
   size_t MCU_rows_in_scan;
   size_t blocks_in_MCU;
   size_t num_blocks;
+  uint32_t* symbol_histogram;
 };
 
 }  // namespace jpegli
@@ -138,6 +139,15 @@ struct jpeg_comp_master {
   float psnr_tolerance;
   float min_distance;
   float max_distance;
+  bool amd_vulkan_frontend;
+  float* amd_vulkan_planes[jpegli::kMaxComponents];
+  size_t amd_vulkan_plane_stride[jpegli::kMaxComponents];
+  float* amd_vulkan_quant_field;
+  float* amd_vulkan_dc_coefficients[jpegli::kMaxComponents];
+  int32_t amd_vulkan_last_dc[jpegli::kMaxComponents];
+  bool amd_vulkan_trace;
+  uint64_t amd_vulkan_plane_capture_ns;
+  uint64_t amd_vulkan_dc_ns;
 };
 
 #endif  // JPEGLI_LIB_JPEGLI_ENCODE_INTERNAL_H_

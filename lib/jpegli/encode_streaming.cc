@@ -230,6 +230,61 @@ void ComputeCoefficientsForiMCURow(j_compress_ptr cinfo) {
   ProcessiMCURow<kStreamingModeCoefficients>(cinfo);
 }
 
+void ComputeAmdVulkanFrontendCoefficients(j_compress_ptr cinfo) {
+  jpeg_comp_master* m = cinfo->master;
+  const int xsize_mcus =
+      DivCeil(cinfo->image_width, 8 * cinfo->max_h_samp_factor);
+  coeff_t last_dc_coeff[kMaxComponents] = {};
+  int32_t* block = m->block_tmp;
+  for (size_t mcu_y = 0; mcu_y < cinfo->total_iMCU_rows; ++mcu_y) {
+    JBLOCKARRAY blocks[kMaxComponents];
+    for (int c = 0; c < cinfo->num_components; ++c) {
+      jpeg_component_info* comp = &cinfo->comp_info[c];
+      const int by0 = mcu_y * comp->v_samp_factor;
+      const int rows =
+          std::min<int>(comp->v_samp_factor, comp->height_in_blocks - by0);
+      blocks[c] = (*cinfo->mem->access_virt_barray)(
+          reinterpret_cast<j_common_ptr>(cinfo), m->coeff_buffers[c], by0, rows,
+          true);
+    }
+    for (int mcu_x = 0; mcu_x < xsize_mcus; ++mcu_x) {
+      for (int c = 0; c < cinfo->num_components; ++c) {
+        jpeg_component_info* comp = &cinfo->comp_info[c];
+        const float* qmc = m->quant_mul[c];
+        const float* zero_bias_offset = m->zero_bias_offset[c];
+        const float* zero_bias_mul = m->zero_bias_mul[c];
+        const size_t plane_stride = m->amd_vulkan_plane_stride[c];
+        for (int iy = 0; iy < comp->v_samp_factor; ++iy) {
+          for (int ix = 0; ix < comp->h_samp_factor; ++ix) {
+            const size_t by = mcu_y * comp->v_samp_factor + iy;
+            const size_t bx = mcu_x * comp->h_samp_factor + ix;
+            if (bx >= comp->width_in_blocks || by >= comp->height_in_blocks) {
+              continue;
+            }
+            const float aq_strength =
+                m->use_adaptive_quantization
+                    ? m->amd_vulkan_quant_field
+                          [(mcu_y * cinfo->max_v_samp_factor + iy) *
+                               m->xsize_blocks +
+                           bx * m->h_factor[c]]
+                    : 0.0f;
+            const float* pixels = m->amd_vulkan_planes[c] +
+                                  by * DCTSIZE * plane_stride + bx * DCTSIZE;
+            ComputeCoefficientBlock(pixels, plane_stride, qmc, last_dc_coeff[c],
+                                    aq_strength, zero_bias_offset,
+                                    zero_bias_mul, m->dct_buffer, block);
+            JCOEF* cblock = &blocks[c][iy][bx][0];
+            for (int k = 0; k < DCTSIZE2; ++k) {
+              cblock[k] = block[kJPEGNaturalOrder[k]];
+            }
+            last_dc_coeff[c] = block[0];
+          }
+        }
+      }
+    }
+  }
+}
+
 void ComputeTokensForiMCURow(j_compress_ptr cinfo) {
   ProcessiMCURow<kStreamingModeTokens>(cinfo);
 }
@@ -246,11 +301,16 @@ HWY_AFTER_NAMESPACE();
 #if HWY_ONCE
 namespace jpegli {
 HWY_EXPORT(ComputeCoefficientsForiMCURow);
+HWY_EXPORT(ComputeAmdVulkanFrontendCoefficients);
 HWY_EXPORT(ComputeTokensForiMCURow);
 HWY_EXPORT(WriteiMCURow);
 
 void ComputeCoefficientsForiMCURow(j_compress_ptr cinfo) {
   HWY_DYNAMIC_DISPATCH(ComputeCoefficientsForiMCURow)(cinfo);
+}
+
+void ComputeAmdVulkanFrontendCoefficients(j_compress_ptr cinfo) {
+  HWY_DYNAMIC_DISPATCH(ComputeAmdVulkanFrontendCoefficients)(cinfo);
 }
 
 void ComputeTokensForiMCURow(j_compress_ptr cinfo) {
