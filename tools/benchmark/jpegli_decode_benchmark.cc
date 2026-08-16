@@ -24,9 +24,11 @@
 #include <map>
 #include <numeric>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -133,6 +135,27 @@ struct Args {
         '\0', "apple_metal_benchmark",
         "benchmark CPU jpegli, Metal scanlines, and direct Metal output",
         &apple_metal_benchmark, &SetBooleanTrue);
+    cmdline->AddOptionFlag(
+        '\0', "energy_benchmark",
+        "measure long-window per-process decode energy without concurrent "
+        "images",
+        &energy_benchmark, &SetBooleanTrue);
+    cmdline->AddOptionValue(
+        '\0', "energy_paths", "LIST",
+        "comma-separated energy paths (default: all paths available in this "
+        "build)",
+        &energy_paths, &ParseString);
+    cmdline->AddOptionValue(
+        '\0', "energy_window_ms", "N",
+        "minimum serial decode time in each energy window (default: 2000)",
+        &energy_window_ms, &ParseUnsigned);
+    cmdline->AddOptionValue('\0', "energy_trials", "N",
+                            "energy windows per image/path (default: 5)",
+                            &energy_trials, &ParseUnsigned);
+    cmdline->AddOptionValue(
+        '\0', "energy_settle_ms", "N",
+        "idle interval before each energy window (default: 250)",
+        &energy_settle_ms, &ParseUnsigned);
   }
 
   const char* input = nullptr;
@@ -150,6 +173,18 @@ struct Args {
   bool decode_stage_profile = false;
   std::string stage_progressive_levels = "0,2";
   bool apple_metal_benchmark = false;
+  bool energy_benchmark = false;
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+  std::string energy_paths =
+      "jpegli,turbojpeg,apple_imageio,metal_to_cpu,metal_direct";
+#elif defined(JPEGLI_HAVE_APPLE_IMAGEIO)
+  std::string energy_paths = "jpegli,turbojpeg,apple_imageio";
+#else
+  std::string energy_paths = "jpegli,turbojpeg";
+#endif
+  size_t energy_window_ms = 2000;
+  size_t energy_trials = 5;
+  size_t energy_settle_ms = 250;
 };
 
 struct ImageBenchmark {
@@ -257,6 +292,31 @@ struct MetalImageBenchmark {
 #if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
   std::vector<MetalDecodeSample> metal_caller_texture;
 #endif
+};
+
+enum class EnergyPath {
+  kJpegli,
+  kTurboJPEG,
+#if defined(JPEGLI_HAVE_APPLE_IMAGEIO)
+  kAppleImageIO,
+#endif
+  kMetalScanlines,
+  kMetalDirect,
+};
+
+struct EnergySample {
+  EnergyPath path = EnergyPath::kJpegli;
+  size_t trial = 0;
+  size_t decodes = 0;
+  double wall_seconds = 0.0;
+  double process_cpu_seconds = 0.0;
+  uint64_t process_energy_nj = 0;
+  bool process_energy_available = false;
+};
+
+struct EnergyImageBenchmark {
+  ImageBenchmark image;
+  std::vector<EnergySample> samples;
 };
 
 struct JpegliErrorManager {
@@ -744,6 +804,81 @@ bool DecodeJpegliMetalPath(const ImageBenchmark& image, MetalDecodePath path,
   return true;
 }
 
+// Energy windows intentionally avoid per-decode profiling and validation
+// readback. The endpoint still completes reconstruction, checks the exported
+// layout, consumes one output byte, and performs the normal finish/destroy/
+// release lifecycle for every single-image decode.
+bool DecodeJpegliMetalDirectForEnergy(const ImageBenchmark& image,
+                                      std::string* error) {
+  jpeg_decompress_struct cinfo = {};
+  JpegliErrorManager jerr = {};
+  JpegliAppleMetalOutput output = {};
+  volatile bool created = false;
+  volatile bool exported = false;
+  cinfo.err = jpegli_std_error(&jerr.pub);
+  jerr.pub.error_exit = JpegliErrorExit;
+  if (setjmp(jerr.jump_buffer)) {
+    if (exported) jpegli_apple_metal_release_output(&output);
+    if (created) jpegli_destroy_decompress(&cinfo);
+    *error = std::string("jpegli: ") + jerr.message;
+    return false;
+  }
+
+  jpegli_create_decompress(&cinfo);
+  created = true;
+  jpegli_apple_metal_set_mode(&cinfo, JPEGLI_APPLE_METAL_FORCE);
+  jpegli_mem_src(&cinfo, image.jpeg.data(), image.jpeg.size());
+  if (jpegli_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+    *error = "jpegli: failed to read JPEG header";
+    jpegli_destroy_decompress(&cinfo);
+    return false;
+  }
+  cinfo.out_color_space = JCS_EXT_RGBA;
+  if (!jpegli_start_decompress_to_apple_metal(&cinfo, &output)) {
+    JpegliAppleMetalStats stats = {};
+    jpegli_apple_metal_get_stats(&cinfo, &stats);
+    *error = "direct Metal decode was unavailable";
+    if (stats.fallback_reason[0] != '\0') {
+      *error += std::string(": ") + stats.fallback_reason;
+    }
+    jpegli_destroy_decompress(&cinfo);
+    return false;
+  }
+  exported = true;
+  if (output.width != image.width || output.height != image.height ||
+      output.buffer_contents == nullptr ||
+      output.row_bytes < image.width * kOutputChannels) {
+    *error = "direct Metal output has invalid dimensions or layout";
+    jpegli_apple_metal_release_output(&output);
+    jpegli_destroy_decompress(&cinfo);
+    return false;
+  }
+  const uint8_t* pixels = static_cast<const uint8_t*>(output.buffer_contents);
+  decode_sink ^= pixels[(image.height / 2) * output.row_bytes +
+                        (image.width / 2) * kOutputChannels];
+
+  if (!jpegli_finish_decompress(&cinfo)) {
+    *error = "jpegli: failed to finish decompression";
+    jpegli_apple_metal_release_output(&output);
+    jpegli_destroy_decompress(&cinfo);
+    return false;
+  }
+  JpegliAppleMetalStats stats = {};
+  jpegli_apple_metal_get_stats(&cinfo, &stats);
+  if (!stats.used_metal || !stats.direct_output) {
+    *error = "forced direct Metal energy decode fell back to CPU";
+    if (stats.fallback_reason[0] != '\0') {
+      *error += std::string(": ") + stats.fallback_reason;
+    }
+    jpegli_apple_metal_release_output(&output);
+    jpegli_destroy_decompress(&cinfo);
+    return false;
+  }
+  jpegli_destroy_decompress(&cinfo);
+  jpegli_apple_metal_release_output(&output);
+  return true;
+}
+
 bool DecodeWithTurboJPEG(const ImageBenchmark& image, uint8_t* output,
                          std::string* error) {
   tjhandle handle = tj3Init(TJINIT_DECOMPRESS);
@@ -844,6 +979,51 @@ bool DecodeWithAppleImageIO(const ImageBenchmark& image, uint8_t* output,
   return true;
 }
 #endif
+
+const char* EnergyPathName(EnergyPath path) {
+  switch (path) {
+    case EnergyPath::kJpegli:
+      return "jpegli";
+    case EnergyPath::kTurboJPEG:
+      return "turbojpeg";
+#if defined(JPEGLI_HAVE_APPLE_IMAGEIO)
+    case EnergyPath::kAppleImageIO:
+      return "apple_imageio";
+#endif
+    case EnergyPath::kMetalScanlines:
+      return "metal_to_cpu";
+    case EnergyPath::kMetalDirect:
+      return "metal_direct";
+  }
+  return "unknown";
+}
+
+bool EnergyPathUsesMetal(EnergyPath path) {
+  return path == EnergyPath::kMetalScanlines ||
+         path == EnergyPath::kMetalDirect;
+}
+
+bool DecodeEnergyPath(EnergyPath path, const ImageBenchmark& image,
+                      uint8_t* output, std::string* error) {
+  switch (path) {
+    case EnergyPath::kJpegli:
+      return DecodeWithJpegli(image, output, error, nullptr,
+                              JPEGLI_APPLE_METAL_DISABLED);
+    case EnergyPath::kTurboJPEG:
+      return DecodeWithTurboJPEG(image, output, error);
+#if defined(JPEGLI_HAVE_APPLE_IMAGEIO)
+    case EnergyPath::kAppleImageIO:
+      return DecodeWithAppleImageIO(image, output, error);
+#endif
+    case EnergyPath::kMetalScanlines:
+      return DecodeWithJpegli(image, output, error, nullptr,
+                              JPEGLI_APPLE_METAL_FORCE);
+    case EnergyPath::kMetalDirect:
+      return DecodeJpegliMetalDirectForEnergy(image, error);
+  }
+  *error = "unknown energy benchmark path";
+  return false;
+}
 
 uint64_t Checksum(const uint8_t* bytes, size_t size) {
   uint64_t hash = 1469598103934665603ULL;
@@ -2310,14 +2490,396 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
   return EXIT_SUCCESS;
 }
 
+bool ParseEnergyPaths(const std::string& list, std::vector<EnergyPath>* paths,
+                      std::string* error) {
+  std::set<std::string> seen;
+  std::stringstream stream(list);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    token = Trim(token);
+    if (token.empty()) {
+      *error = "empty path in --energy_paths";
+      return false;
+    }
+    if (!seen.insert(token).second) {
+      *error = "duplicate path in --energy_paths: " + token;
+      return false;
+    }
+    if (token == "jpegli") {
+      paths->push_back(EnergyPath::kJpegli);
+    } else if (token == "turbojpeg") {
+      paths->push_back(EnergyPath::kTurboJPEG);
+    } else if (token == "apple_imageio") {
+#if defined(JPEGLI_HAVE_APPLE_IMAGEIO)
+      paths->push_back(EnergyPath::kAppleImageIO);
+#else
+      *error = "apple_imageio energy path is unavailable in this build";
+      return false;
+#endif
+    } else if (token == "metal_to_cpu") {
+      paths->push_back(EnergyPath::kMetalScanlines);
+    } else if (token == "metal_direct") {
+      paths->push_back(EnergyPath::kMetalDirect);
+    } else {
+      *error = "unknown path in --energy_paths: " + token;
+      return false;
+    }
+  }
+  if (paths->empty()) {
+    *error = "--energy_paths must not be empty";
+    return false;
+  }
+  return true;
+}
+
+std::string EnergyImageType(const std::string& name) {
+  const std::string stem = fs::path(name).stem().string();
+  const size_t separator = stem.find("__");
+  return separator == std::string::npos ? "unspecified"
+                                        : stem.substr(0, separator);
+}
+
+bool ValidateEnergyImage(const ImageBenchmark& image,
+                         const std::vector<EnergyPath>& paths,
+                         std::vector<uint8_t>* reference,
+                         std::vector<uint8_t>* candidate, std::string* error) {
+  if (!DecodeWithJpegli(image, reference->data(), error, nullptr,
+                        JPEGLI_APPLE_METAL_DISABLED)) {
+    return false;
+  }
+  if (!HasOpaqueAlpha(reference->data(), image.output_size)) {
+    *error = "CPU jpegli produced non-opaque RGBA output";
+    return false;
+  }
+  const uint64_t reference_checksum =
+      Checksum(reference->data(), image.output_size);
+
+  for (EnergyPath path : paths) {
+    if (path == EnergyPath::kJpegli) continue;
+    std::fill(candidate->begin(), candidate->begin() + image.output_size, 0);
+    if (EnergyPathUsesMetal(path)) {
+      MetalDecodeSample sample;
+      const MetalDecodePath metal_path = path == EnergyPath::kMetalScanlines
+                                             ? MetalDecodePath::kMetalScanlines
+                                             : MetalDecodePath::kMetalDirect;
+      if (!DecodeJpegliMetalPath(image, metal_path, candidate->data(), &sample,
+                                 error)) {
+        return false;
+      }
+      if (memcmp(reference->data(), candidate->data(), image.output_size) !=
+          0) {
+        *error = std::string(EnergyPathName(path)) +
+                 " did not match CPU jpegli byte-for-byte";
+        return false;
+      }
+    } else if (!DecodeEnergyPath(path, image, candidate->data(), error)) {
+      return false;
+    }
+    if (!HasOpaqueAlpha(candidate->data(), image.output_size)) {
+      *error = std::string(EnergyPathName(path)) +
+               " produced non-opaque RGBA output";
+      return false;
+    }
+    decode_sink ^=
+        Checksum(candidate->data(), image.output_size) ^ reference_checksum;
+  }
+  return true;
+}
+
+uint64_t UnixTimeNanoseconds() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+bool RunEnergyWindow(const ImageBenchmark& image, EnergyPath path, size_t trial,
+                     const Args& args, uint8_t* output, EnergySample* sample,
+                     std::string* error) {
+  if (args.energy_settle_ms != 0) {
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(args.energy_settle_ms));
+  }
+  const uint64_t marker_start_ns = UnixTimeNanoseconds();
+  fprintf(stderr,
+          "ENERGY_WINDOW_BEGIN timestamp_ns=%llu image=%s path=%s trial=%zu\n",
+          static_cast<unsigned long long>(marker_start_ns), image.name.c_str(),
+          EnergyPathName(path), trial);
+  fflush(stderr);
+
+  uint64_t energy_start = 0;
+  const bool energy_started = ReadProcessEnergy(&energy_start);
+  const std::clock_t process_cpu_start = std::clock();
+  const auto wall_start = std::chrono::steady_clock::now();
+  const double target_seconds = args.energy_window_ms * 1e-3;
+  size_t decodes = 0;
+  do {
+    error->clear();
+    if (!DecodeEnergyPath(path, image, output, error)) return false;
+    if (path != EnergyPath::kMetalDirect) {
+      decode_sink ^= output[image.output_size / 2];
+    }
+    ++decodes;
+  } while (std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                         wall_start)
+               .count() < target_seconds);
+  const auto wall_end = std::chrono::steady_clock::now();
+  const std::clock_t process_cpu_end = std::clock();
+  uint64_t energy_end = 0;
+  const bool energy_ended = ReadProcessEnergy(&energy_end);
+
+  sample->path = path;
+  sample->trial = trial;
+  sample->decodes = decodes;
+  sample->wall_seconds =
+      std::chrono::duration<double>(wall_end - wall_start).count();
+  sample->process_cpu_seconds =
+      static_cast<double>(process_cpu_end - process_cpu_start) / CLOCKS_PER_SEC;
+  if (energy_started && energy_ended && energy_end > energy_start) {
+    sample->process_energy_nj = energy_end - energy_start;
+    sample->process_energy_available = true;
+  }
+  const uint64_t marker_end_ns = UnixTimeNanoseconds();
+  fprintf(stderr,
+          "ENERGY_WINDOW_END timestamp_ns=%llu image=%s path=%s trial=%zu "
+          "decodes=%zu wall_ms=%.3f energy_mj=%.6f available=%d\n",
+          static_cast<unsigned long long>(marker_end_ns), image.name.c_str(),
+          EnergyPathName(path), trial, decodes, sample->wall_seconds * 1e3,
+          sample->process_energy_nj * 1e-6,
+          sample->process_energy_available ? 1 : 0);
+  fflush(stderr);
+  return true;
+}
+
+double EnergyMillijoulesPerDecode(const EnergySample& sample) {
+  return sample.process_energy_nj * 1e-6 / sample.decodes;
+}
+
+double EnergyMillijoulesPerMegapixel(const EnergySample& sample,
+                                     size_t pixels) {
+  return sample.process_energy_nj * 1e-6 / (sample.decodes * pixels * 1e-6);
+}
+
+double EnergyAveragePowerWatts(const EnergySample& sample) {
+  return sample.process_energy_nj * 1e-9 / sample.wall_seconds;
+}
+
+double EnergyLatencyMilliseconds(const EnergySample& sample) {
+  return sample.wall_seconds * 1e3 / sample.decodes;
+}
+
+bool WriteEnergyCsv(const std::string& path,
+                    const std::vector<EnergyImageBenchmark>& benchmarks,
+                    const Args& args, std::string* error) {
+  std::ofstream out(path);
+  if (!out) {
+    *error = "failed to open energy CSV output " + path;
+    return false;
+  }
+  out << "image,image_type,width,height,pixels,jpeg_bytes,bits_per_pixel,"
+         "quality,chroma_subsampling,progressive_level,path,trial,decodes,"
+         "requested_window_ms,wall_ms,process_cpu_ms,energy_available,"
+         "process_energy_mj,energy_mj_per_decode,energy_mj_per_megapixel,"
+         "average_process_power_w,latency_ms_per_decode,"
+         "process_cpu_ms_per_decode,megapixels_per_second,jpegli_version,"
+         "turbojpeg_api\n";
+  out << std::fixed << std::setprecision(9);
+  for (const EnergyImageBenchmark& benchmark : benchmarks) {
+    const ImageBenchmark& image = benchmark.image;
+    const size_t pixels = image.width * image.height;
+    const double bits_per_pixel =
+        8.0 * image.jpeg.size() / static_cast<double>(pixels);
+    for (const EnergySample& sample : benchmark.samples) {
+      const double energy_mj = sample.process_energy_nj * 1e-6;
+      out << CsvEscape(image.name) << ','
+          << CsvEscape(EnergyImageType(image.name)) << ',' << image.width << ','
+          << image.height << ',' << pixels << ',' << image.jpeg.size() << ','
+          << bits_per_pixel << ',' << args.quality << ','
+          << args.chroma_subsampling << ',' << args.progressive_level << ','
+          << EnergyPathName(sample.path) << ',' << sample.trial << ','
+          << sample.decodes << ',' << args.energy_window_ms << ','
+          << sample.wall_seconds * 1e3 << ','
+          << sample.process_cpu_seconds * 1e3 << ','
+          << (sample.process_energy_available ? 1 : 0) << ',' << energy_mj
+          << ','
+          << (sample.process_energy_available
+                  ? EnergyMillijoulesPerDecode(sample)
+                  : 0.0)
+          << ','
+          << (sample.process_energy_available
+                  ? EnergyMillijoulesPerMegapixel(sample, pixels)
+                  : 0.0)
+          << ','
+          << (sample.process_energy_available ? EnergyAveragePowerWatts(sample)
+                                              : 0.0)
+          << ',' << EnergyLatencyMilliseconds(sample) << ','
+          << sample.process_cpu_seconds * 1e3 / sample.decodes << ','
+          << pixels * sample.decodes * 1e-6 / sample.wall_seconds << ','
+          << kJpegliVersion << ',' << TURBOJPEG_VERSION_NUMBER << '\n';
+    }
+  }
+  if (!out) {
+    *error = "failed while writing energy CSV output " + path;
+    return false;
+  }
+  return true;
+}
+
+void PrintEnergyResults(const std::vector<EnergyImageBenchmark>& benchmarks,
+                        const std::vector<EnergyPath>& paths) {
+  printf("\n%-17s %-15s %7s %-15s %11s %11s %9s %10s %10s\n", "image", "type",
+         "MP", "path", "mJ/img p50", "mJ/img p95", "watts", "ms/image",
+         "mJ/MP");
+  printf("%-17s %-15s %7s %-15s %11s %11s %9s %10s %10s\n", "-----------------",
+         "---------------", "-------", "---------------", "-----------",
+         "-----------", "---------", "----------", "----------");
+  for (const EnergyImageBenchmark& benchmark : benchmarks) {
+    const size_t pixels = benchmark.image.width * benchmark.image.height;
+    for (EnergyPath path : paths) {
+      std::vector<double> energy_per_decode;
+      std::vector<double> power;
+      std::vector<double> latency;
+      std::vector<double> energy_per_mp;
+      for (const EnergySample& sample : benchmark.samples) {
+        if (sample.path != path) continue;
+        latency.push_back(EnergyLatencyMilliseconds(sample));
+        if (!sample.process_energy_available) continue;
+        energy_per_decode.push_back(EnergyMillijoulesPerDecode(sample));
+        energy_per_mp.push_back(EnergyMillijoulesPerMegapixel(sample, pixels));
+        power.push_back(EnergyAveragePowerWatts(sample));
+      }
+      if (latency.empty()) continue;
+      if (energy_per_decode.empty()) {
+        printf("%-17s %-15s %7.3f %-15s %11s %11s %9s %10.3f %10s\n",
+               ShortName(benchmark.image.name).c_str(),
+               EnergyImageType(benchmark.image.name).c_str(), pixels / 1e6,
+               EnergyPathName(path), "unavailable", "unavailable", "unavail.",
+               Percentile(latency, 0.50), "unavail.");
+      } else {
+        printf("%-17s %-15s %7.3f %-15s %11.4f %11.4f %9.3f %10.3f %10.4f\n",
+               ShortName(benchmark.image.name).c_str(),
+               EnergyImageType(benchmark.image.name).c_str(), pixels / 1e6,
+               EnergyPathName(path), Percentile(energy_per_decode, 0.50),
+               Percentile(energy_per_decode, 0.95), Percentile(power, 0.50),
+               Percentile(latency, 0.50), Percentile(energy_per_mp, 0.50));
+      }
+    }
+  }
+  printf(
+      "\nEnergy is the macOS per-process ri_energy_nj delta over long serial "
+      "windows. Watts are process-attributed energy divided by window wall "
+      "time, not whole-system wall power.\n");
+}
+
+int RunEnergyBenchmark(std::vector<ImageBenchmark> images, const Args& args) {
+  std::vector<EnergyPath> paths;
+  std::string error;
+  if (!ParseEnergyPaths(args.energy_paths, &paths, &error)) {
+    fprintf(stderr, "%s\n", error.c_str());
+    return EXIT_FAILURE;
+  }
+  if (std::any_of(paths.begin(), paths.end(), EnergyPathUsesMetal) &&
+      !jpegli_apple_metal_is_available()) {
+    fprintf(stderr,
+            "a Metal energy path was requested, but Apple Metal is "
+            "unavailable\n");
+    return EXIT_FAILURE;
+  }
+  uint64_t initial_energy = 0;
+  if (!ReadProcessEnergy(&initial_energy)) {
+    fprintf(stderr,
+            "the macOS per-process energy counter is unavailable on this "
+            "host\n");
+    return EXIT_FAILURE;
+  }
+
+  size_t max_output_size = 0;
+  std::vector<EnergyImageBenchmark> benchmarks;
+  benchmarks.reserve(images.size());
+  for (ImageBenchmark& image : images) {
+    max_output_size = std::max(max_output_size, image.output_size);
+    EnergyImageBenchmark benchmark;
+    benchmark.image = std::move(image);
+    benchmarks.push_back(std::move(benchmark));
+  }
+  std::vector<uint8_t> reference(max_output_size);
+  std::vector<uint8_t> output(max_output_size);
+
+  fprintf(stderr,
+          "Validating %zu energy paths, then measuring %zu serial window(s) "
+          "of at least %zu ms per image/path. No images are concurrent or "
+          "pipelined.\n",
+          paths.size(), args.energy_trials, args.energy_window_ms);
+  for (EnergyImageBenchmark& benchmark : benchmarks) {
+    if (!ValidateEnergyImage(benchmark.image, paths, &reference, &output,
+                             &error)) {
+      fprintf(stderr, "%s: %s\n", benchmark.image.name.c_str(), error.c_str());
+      return EXIT_FAILURE;
+    }
+  }
+
+  std::vector<size_t> image_order(benchmarks.size());
+  std::iota(image_order.begin(), image_order.end(), 0);
+  uint32_t seed = 0x454e4552U + static_cast<uint32_t>(args.quality * 131) +
+                  static_cast<uint32_t>(args.progressive_level * 17);
+  for (char c : args.chroma_subsampling) {
+    seed = seed * 33U + static_cast<unsigned char>(c);
+  }
+  std::mt19937 rng(seed);
+  std::shuffle(image_order.begin(), image_order.end(), rng);
+
+  for (size_t ordered_index : image_order) {
+    EnergyImageBenchmark& benchmark = benchmarks[ordered_index];
+    for (size_t repetition = 0; repetition < args.warmups; ++repetition) {
+      for (size_t position = 0; position < paths.size(); ++position) {
+        const EnergyPath path = paths[(repetition + position) % paths.size()];
+        if (!DecodeEnergyPath(path, benchmark.image, output.data(), &error)) {
+          fprintf(stderr, "%s warmup: %s\n", benchmark.image.name.c_str(),
+                  error.c_str());
+          return EXIT_FAILURE;
+        }
+      }
+    }
+    for (size_t trial = 0; trial < args.energy_trials; ++trial) {
+      for (size_t position = 0; position < paths.size(); ++position) {
+        const EnergyPath path = paths[(trial + position) % paths.size()];
+        EnergySample sample;
+        if (!RunEnergyWindow(benchmark.image, path, trial, args, output.data(),
+                             &sample, &error)) {
+          fprintf(stderr, "%s %s trial %zu: %s\n", benchmark.image.name.c_str(),
+                  EnergyPathName(path), trial, error.c_str());
+          return EXIT_FAILURE;
+        }
+        benchmark.samples.push_back(sample);
+      }
+    }
+    fprintf(stderr, "energy benchmarked %s (%zux%zu)\n",
+            benchmark.image.name.c_str(), benchmark.image.width,
+            benchmark.image.height);
+  }
+
+  PrintEnergyResults(benchmarks, paths);
+  if (!args.csv.empty() &&
+      !WriteEnergyCsv(args.csv, benchmarks, args, &error)) {
+    fprintf(stderr, "%s\n", error.c_str());
+    return EXIT_FAILURE;
+  }
+  if (!args.csv.empty()) {
+    printf("Raw energy benchmark CSV written to %s\n", args.csv.c_str());
+  }
+  return EXIT_SUCCESS;
+}
+
 bool ValidateArgs(const Args& args) {
   const int special_modes = static_cast<int>(args.perceptual_quality) +
                             static_cast<int>(args.decode_stage_profile) +
-                            static_cast<int>(args.apple_metal_benchmark);
+                            static_cast<int>(args.apple_metal_benchmark) +
+                            static_cast<int>(args.energy_benchmark);
   if (special_modes > 1) {
     fprintf(stderr,
-            "--perceptual_quality, --decode_stage_profile, and "
-            "--apple_metal_benchmark are mutually exclusive\n");
+            "--perceptual_quality, --decode_stage_profile, "
+            "--apple_metal_benchmark, and --energy_benchmark are mutually "
+            "exclusive\n");
     return false;
   }
   if (args.quality < 1 || args.quality > 100) {
@@ -2335,6 +2897,14 @@ bool ValidateArgs(const Args& args) {
   }
   if (args.iterations == 0) {
     fprintf(stderr, "--iterations must be greater than zero\n");
+    return false;
+  }
+  if (args.energy_benchmark && args.energy_window_ms < 100) {
+    fprintf(stderr, "--energy_window_ms must be at least 100\n");
+    return false;
+  }
+  if (args.energy_benchmark && args.energy_trials == 0) {
+    fprintf(stderr, "--energy_trials must be greater than zero\n");
     return false;
   }
   return true;
@@ -2415,6 +2985,9 @@ int DecodeBenchmarkMain(int argc, const char* argv[]) {
 
   if (args.apple_metal_benchmark) {
     return RunAppleMetalBenchmark(std::move(images), args);
+  }
+  if (args.energy_benchmark) {
+    return RunEnergyBenchmark(std::move(images), args);
   }
 
   std::vector<uint8_t> jpegli_output(max_output_size);
