@@ -169,6 +169,11 @@ struct jpeg_decomp_master {
   bool apple_metal_active_ = false;
   bool apple_metal_direct_ = false;
   uint8_t* apple_metal_cpu_pixels_ = nullptr;
+  bool apple_metal_bias_stats_enabled_ = false;
+  std::vector<int> apple_metal_row_nonzeros_;
+  std::vector<int> apple_metal_row_sumabs_;
+  void* apple_metal_command_buffer_ = nullptr;
+  void* apple_metal_destination_texture_ = nullptr;
 };
 
 namespace jpegli {

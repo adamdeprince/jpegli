@@ -186,6 +186,9 @@ bool EncodeTestJpeg(size_t width, size_t height, int quality,
     } else if (strcmp(sampling, "422") == 0) {
       cinfo.comp_info[0].h_samp_factor = 2;
       cinfo.comp_info[0].v_samp_factor = 1;
+    } else if (strcmp(sampling, "440") == 0) {
+      cinfo.comp_info[0].h_samp_factor = 1;
+      cinfo.comp_info[0].v_samp_factor = 2;
     } else if (strcmp(sampling, "411") == 0) {
       cinfo.comp_info[0].h_samp_factor = 4;
       cinfo.comp_info[0].v_samp_factor = 1;
@@ -341,7 +344,7 @@ bool DecodeSuspended(const std::vector<uint8_t>& encoded,
 TEST(AppleMetalTest, ExactBaselineProgressiveSamplingQualityAndRestart) {
   if (!jpegli_apple_metal_is_available()) GTEST_SKIP();
   for (int quality : {50, 95}) {
-    for (const char* sampling : {"444", "422", "420"}) {
+    for (const char* sampling : {"444", "440", "422", "420"}) {
       for (bool progressive : {false, true}) {
         std::vector<uint8_t> encoded;
         ASSERT_TRUE(EncodeTestJpeg(257, 193, quality, sampling, progressive,
@@ -363,6 +366,15 @@ TEST(AppleMetalTest, ExactBaselineProgressiveSamplingQualityAndRestart) {
         EXPECT_EQ(cpu, direct) << sampling << " q" << quality;
         EXPECT_EQ(1, metal_stats.used_metal);
         EXPECT_EQ(0, metal_stats.direct_output);
+        EXPECT_EQ(0u, metal_stats.coefficient_copy_ns);
+        EXPECT_GT(metal_stats.unified_coefficient_bytes, 0u);
+        EXPECT_EQ(strcmp(sampling, "440") == 0 ? 0 : 1,
+                  metal_stats.fused_pipeline);
+        if (strcmp(sampling, "444") == 0) {
+          EXPECT_EQ(0u, metal_stats.float_plane_bytes);
+        } else {
+          EXPECT_GT(metal_stats.float_plane_bytes, 0u);
+        }
         EXPECT_EQ(1, direct_stats.used_metal);
         EXPECT_EQ(1, direct_stats.direct_output);
       }
@@ -386,6 +398,8 @@ TEST(AppleMetalTest, ExactGrayscaleAndRgbJpeg) {
                                &stats));
     EXPECT_EQ(cpu, metal);
     EXPECT_EQ(1, stats.used_metal);
+    EXPECT_EQ(1, stats.fused_pipeline);
+    EXPECT_EQ(0u, stats.float_plane_bytes);
   }
 }
 
@@ -475,6 +489,9 @@ TEST(AppleMetalTest, UnavailableDirectEndpointLeavesCpuDecodeUsable) {
   ASSERT_EQ(JPEG_HEADER_OK, jpegli_read_header(&cinfo, TRUE));
   cinfo.out_color_space = JCS_EXT_RGBA;
   JpegliAppleMetalOutput output = {};
+  EXPECT_FALSE(jpegli_start_decompress_to_apple_metal_command_buffer(
+      &cinfo, reinterpret_cast<void*>(1), reinterpret_cast<void*>(2), &output));
+  EXPECT_EQ(nullptr, output.private_handle);
   EXPECT_FALSE(jpegli_start_decompress_to_apple_metal(&cinfo, &output));
   EXPECT_EQ(nullptr, output.private_handle);
   ASSERT_TRUE(jpegli_start_decompress(&cinfo));
@@ -501,6 +518,8 @@ TEST(AppleMetalTest, ExactWithoutFancyUpsampling) {
                              &stats, 1, false));
   EXPECT_EQ(cpu, metal);
   EXPECT_EQ(1, stats.used_metal);
+  EXPECT_EQ(0u, stats.coefficient_copy_ns);
+  EXPECT_EQ(0u, stats.float_plane_bytes);
 }
 
 TEST(AppleMetalTest, DirectScaledOutputUsesExactCpuFallback) {

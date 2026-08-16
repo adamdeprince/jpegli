@@ -13,7 +13,7 @@
 #if !defined(JPEGLI_ENABLE_APPLE_METAL)
 
 namespace {
-std::atomic<size_t> g_stub_crossover_pixels{786432};
+std::atomic<size_t> g_stub_crossover_pixels{480000};
 }
 
 namespace jpegli {
@@ -28,6 +28,16 @@ bool AppleMetalReconstruct(j_decompress_ptr cinfo, bool direct_output) {
   SetAppleMetalFallbackReason(cinfo,
                               "Metal support is not enabled in this build");
   return false;
+}
+
+bool AppleMetalPrepareCoefficientStorage(j_decompress_ptr cinfo) {
+  SetAppleMetalFallbackReason(cinfo,
+                              "Metal support is not enabled in this build");
+  return false;
+}
+
+JBLOCK* AppleMetalCoefficientPlane(j_decompress_ptr cinfo, int component) {
+  return nullptr;
 }
 
 JDIMENSION AppleMetalReadScanlines(j_decompress_ptr cinfo, JSAMPARRAY scanlines,
@@ -46,7 +56,16 @@ bool AppleMetalUploadCpuOutput(j_decompress_ptr cinfo, const uint8_t* pixels,
   return false;
 }
 
-void AppleMetalResetDecoder(j_decompress_ptr cinfo) {}
+void AppleMetalResetDecoder(j_decompress_ptr cinfo) {
+  if (cinfo == nullptr || cinfo->master == nullptr) return;
+  cinfo->master->apple_metal_decoder_ = nullptr;
+  cinfo->master->apple_metal_active_ = false;
+  cinfo->master->apple_metal_bias_stats_enabled_ = false;
+  cinfo->master->apple_metal_row_nonzeros_ = {};
+  cinfo->master->apple_metal_row_sumabs_ = {};
+  cinfo->master->apple_metal_command_buffer_ = nullptr;
+  cinfo->master->apple_metal_destination_texture_ = nullptr;
+}
 
 }  // namespace jpegli
 

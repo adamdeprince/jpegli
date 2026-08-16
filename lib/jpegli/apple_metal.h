@@ -61,13 +61,18 @@ typedef struct {
   uint64_t submission_overhead_ns;
   uint64_t gpu_dequant_idct_ns;
   uint64_t gpu_upsample_color_ns;
+  uint64_t gpu_fused_reconstruction_ns;
   uint64_t cpu_output_copy_ns;
   uint64_t reconstruction_total_ns;
   uint64_t cpu_decoder_bytes;
   uint64_t metal_buffer_bytes;
   uint64_t decoder_retained_bytes;
+  uint64_t unified_coefficient_bytes;
+  uint64_t float_plane_bytes;
   int used_metal;
   int direct_output;
+  int fused_pipeline;
+  int caller_command_buffer;
   char fallback_reason[128];
 } JpegliAppleMetalStats;
 
@@ -89,7 +94,7 @@ void jpegli_apple_metal_get_stats(j_decompress_ptr cinfo,
                                   JpegliAppleMetalStats* stats);
 
 // Controls the process-wide AUTO crossover. FORCE and the direct-output API
-// ignore this threshold. The default is selected from M4 measurements.
+// ignore this threshold. The measured M4 default is 480000 output pixels.
 void jpegli_apple_metal_set_crossover_pixels(size_t pixels);
 size_t jpegli_apple_metal_get_crossover_pixels(void);
 
@@ -100,6 +105,18 @@ size_t jpegli_apple_metal_get_crossover_pixels(void);
 // decoder lifetime.
 boolean jpegli_start_decompress_to_apple_metal(j_decompress_ptr cinfo,
                                                JpegliAppleMetalOutput* output);
+
+// Encodes reconstruction into a caller-owned id<MTLCommandBuffer> and writes
+// directly to a caller-owned RGBA8Unorm id<MTLTexture>. The command buffer is
+// not committed or waited by JPEGli. Both objects must use the same Metal
+// device as JPEGli; the texture must exactly match output dimensions and have
+// MTLTextureUsageShaderWrite. The returned output retains all source resources
+// needed by the encoded work and must be released after the caller has
+// completed (or discarded) the command buffer. buffer and buffer_contents are
+// null because no CPU-readable destination is allocated.
+boolean jpegli_start_decompress_to_apple_metal_command_buffer(
+    j_decompress_ptr cinfo, void* command_buffer, void* destination_texture,
+    JpegliAppleMetalOutput* output);
 
 void jpegli_apple_metal_release_output(JpegliAppleMetalOutput* output);
 

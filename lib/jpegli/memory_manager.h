@@ -22,6 +22,14 @@ void InitMemoryManager(j_common_ptr cinfo);
 uint64_t MemoryManagerCurrentBytes(j_common_ptr cinfo);
 uint64_t MemoryManagerPeakBytes(j_common_ptr cinfo);
 
+// Creates a virtual coefficient array whose samples are supplied by the
+// caller. The row table and control object retain image-pool lifetime, while
+// `blocks` remains caller-owned. This is used by the Apple unified-memory
+// decoder so entropy decoding writes directly into Metal-visible storage.
+jvirt_barray_ptr RequestExternalVirtualBlockArray(
+    j_common_ptr cinfo, boolean pre_zero, JDIMENSION blocksperrow,
+    JDIMENSION numrows, JDIMENSION maxaccess, JBLOCK* blocks);
+
 template <typename T>
 T* Allocate(j_common_ptr cinfo, size_t len, int pool_id = JPOOL_PERMANENT) {
   const size_t size = len * sizeof(T);  // NOLINT

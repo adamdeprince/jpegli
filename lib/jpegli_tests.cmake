@@ -38,6 +38,14 @@ list(APPEND JPEGLI_INTERNAL_TESTS
   ../tools/gauss_blur_test.cc
 )
 
+if(JPEGLI_ENABLE_APPLE_METAL)
+  list(APPEND JPEGLI_INTERNAL_TESTS
+    jpegli/apple_metal_command_buffer_test.mm)
+  set_source_files_properties(
+    jpegli/apple_metal_command_buffer_test.mm PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc -fno-rtti")
+endif()
+
 set(JPEGLI_WASM_TEST_LINK_FLAGS "")
 if (EMSCRIPTEN)
   # The emscripten linking step takes too much memory and crashes during the
@@ -81,6 +89,11 @@ foreach (TESTFILE IN LISTS JPEGLI_INTERNAL_TESTS)
     jpegli_testlib-internal
     jpegli_extras-internal
   )
+  if(TESTFILE STREQUAL jpegli/apple_metal_command_buffer_test.mm)
+    target_include_directories(${TESTNAME} PRIVATE
+      "${CMAKE_CURRENT_BINARY_DIR}/include/jpegli")
+    target_link_libraries(${TESTNAME} ${JPEGLI_METAL_FRAMEWORK})
+  endif()
   if(TESTFILE STREQUAL ../tools/gauss_blur_test.cc)
     target_link_libraries(${TESTNAME} jpegli_gauss_blur)
   endif()

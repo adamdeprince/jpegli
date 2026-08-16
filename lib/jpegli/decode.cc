@@ -63,6 +63,11 @@ void InitializeImage(j_decompress_ptr cinfo) {
   m->apple_metal_attempt_ = false;
   m->apple_metal_direct_ = false;
   m->apple_metal_cpu_pixels_ = nullptr;
+  m->apple_metal_bias_stats_enabled_ = false;
+  m->apple_metal_row_nonzeros_.clear();
+  m->apple_metal_row_sumabs_.clear();
+  m->apple_metal_command_buffer_ = nullptr;
+  m->apple_metal_destination_texture_ = nullptr;
   if (m->decode_profile_enabled_) {
     m->decode_profile_ = {};
   }
@@ -508,9 +513,18 @@ void AllocateCoefficientBuffer(j_decompress_ptr cinfo) {
     jpeg_component_info* comp = &cinfo->comp_info[c];
     size_t height_in_blocks =
         m->streaming_mode_ ? comp->v_samp_factor : comp->height_in_blocks;
-    coef_arrays[c] = (*cinfo->mem->request_virt_barray)(
-        comptr, JPOOL_IMAGE, TRUE, comp->width_in_blocks, height_in_blocks,
-        comp->v_samp_factor);
+    JBLOCK* external = m->apple_metal_attempt_
+                           ? AppleMetalCoefficientPlane(cinfo, c)
+                           : nullptr;
+    if (external != nullptr) {
+      coef_arrays[c] = RequestExternalVirtualBlockArray(
+          comptr, FALSE, comp->width_in_blocks, height_in_blocks,
+          comp->v_samp_factor, external);
+    } else {
+      coef_arrays[c] = (*cinfo->mem->request_virt_barray)(
+          comptr, JPOOL_IMAGE, TRUE, comp->width_in_blocks, height_in_blocks,
+          comp->v_samp_factor);
+    }
   }
   cinfo->master->coef_arrays = coef_arrays;
   (*cinfo->mem->realize_virt_arrays)(comptr);
@@ -839,6 +853,10 @@ boolean jpegli_start_decompress(j_decompress_ptr cinfo) {
       jpegli_calc_output_dimensions(cinfo);
       m->apple_metal_attempt_ =
           jpegli::AppleMetalShouldAttempt(cinfo, m->apple_metal_direct_);
+      if (m->apple_metal_attempt_ &&
+          !jpegli::AppleMetalPrepareCoefficientStorage(cinfo)) {
+        m->apple_metal_attempt_ = false;
+      }
       m->streaming_mode_ = !m->apple_metal_attempt_ && !m->is_multiscan_ &&
                            !FROM_JPEGLI_BOOL(cinfo->buffered_image) &&
                            (!FROM_JPEGLI_BOOL(cinfo->quantize_colors) ||
@@ -1214,6 +1232,12 @@ boolean jpegli_start_decompress_to_apple_metal(j_decompress_ptr cinfo,
     ++cinfo->master->output_passes_done_;
     return TRUE;
   }
+  if (cinfo->master->apple_metal_command_buffer_ != nullptr) {
+    // A caller-owned command buffer endpoint cannot silently substitute a
+    // separately allocated destination. The coefficient-backed CPU decoder
+    // remains valid for the caller to use after this returns false.
+    return FALSE;
+  }
   // Transparent fallback for modes outside the reconstruction kernel's
   // contract. Render through the ordinary scanline path, then place the final
   // RGBA bytes in a shared Metal allocation for the GPU consumer.
@@ -1242,4 +1266,21 @@ boolean jpegli_start_decompress_to_apple_metal(j_decompress_ptr cinfo,
   }
   return TO_JPEGLI_BOOL(
       jpegli::AppleMetalUploadCpuOutput(cinfo, pixels, row_bytes, output));
+}
+
+boolean jpegli_start_decompress_to_apple_metal_command_buffer(
+    j_decompress_ptr cinfo, void* command_buffer, void* destination_texture,
+    JpegliAppleMetalOutput* output) {
+  if (output == nullptr) {
+    JPEGLI_ERROR(
+        "jpegli_start_decompress_to_apple_metal_command_buffer: null output");
+  }
+  *output = {};
+  if (cinfo == nullptr || cinfo->master == nullptr ||
+      command_buffer == nullptr || destination_texture == nullptr) {
+    return FALSE;
+  }
+  cinfo->master->apple_metal_command_buffer_ = command_buffer;
+  cinfo->master->apple_metal_destination_texture_ = destination_texture;
+  return jpegli_start_decompress_to_apple_metal(cinfo, output);
 }

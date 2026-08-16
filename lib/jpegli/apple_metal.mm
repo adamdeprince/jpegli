@@ -56,7 +56,7 @@ bool SafeMul(size_t a, size_t b, size_t* result) {
   return true;
 }
 
-constexpr size_t kDefaultCrossoverPixels = 786432;
+constexpr size_t kDefaultCrossoverPixels = 480000;
 constexpr size_t kMaxMetalWorkingSet = 512u << 20;
 constexpr size_t kMaxCachedScratch = 96u << 20;
 constexpr size_t kMetalAlignment = 256;
@@ -83,8 +83,38 @@ struct DecodeParams {
   uint32_t jpeg_color_space;
   uint32_t fancy_upsampling;
   uint32_t total_imcu_rows;
-  uint32_t reserved;
+  uint32_t variant;
 };
+
+enum class KernelVariant : uint32_t {
+  kLegacy = 0,
+  kGrayscale = 1,
+  k444 = 2,
+  k422 = 3,
+  k420 = 4,
+};
+
+enum class PipelineKind : size_t {
+  kCooperativeIdct,
+  kLegacyConvert,
+  kGrayscale,
+  k444,
+  k422Box,
+  k420Box,
+  k422Fancy,
+  k420Fancy,
+  kCount,
+};
+
+constexpr const char* kPipelineNames[] = {
+    "jpegli_idct_cooperative",      "jpegli_convert",
+    "jpegli_reconstruct_gray",      "jpegli_reconstruct_444",
+    "jpegli_reconstruct_422_box",   "jpegli_reconstruct_420_box",
+    "jpegli_reconstruct_422_fancy", "jpegli_reconstruct_420_fancy",
+};
+
+static_assert(std::size(kPipelineNames) == static_cast<size_t>(PipelineKind::kCount),
+              "Metal pipeline table mismatch");
 
 static_assert(sizeof(ComponentParams) == 32, "Metal component ABI mismatch");
 static_assert(sizeof(DecodeParams) == 128, "Metal decode ABI mismatch");
@@ -118,7 +148,7 @@ struct DecodeParams {
   uint jpeg_color_space;
   uint fancy_upsampling;
   uint total_imcu_rows;
-  uint reserved;
+  uint variant;
 };
 
 inline void idct2(thread const float* input, thread float* output) {
@@ -170,45 +200,74 @@ inline void idct8(thread const float* input, thread float* output) {
   output[4] = fma(-wc3, odd_out[3], even_out[3]);
 }
 
-kernel void jpegli_idct(
+inline void reconstruct_block(
+    device const short* coefficients, device const float* dequant,
+    device const float* biases, constant DecodeParams& params,
+    uint component, uint block_index, bool active, ushort lane,
+    threadgroup float* block) {
+  const ComponentParams cp = params.comp[component];
+  const uint block_y = active ? block_index / cp.blocks_w : 0;
+  const uint imcu = min(block_y / cp.v_samp_factor,
+                        params.total_imcu_rows - 1);
+  if (lane < 8) {
+    float input[8];
+    for (uint x = 0; x < 8; ++x) {
+      const uint k = uint(lane) * 8 + x;
+      const short qi = active
+          ? coefficients[cp.coeff_offset + block_index * 64 + k] : 0;
+      const float q = float(qi);
+      const float bias = active
+          ? biases[(component * params.total_imcu_rows + imcu) * 64 + k]
+          : 0.0f;
+      input[x] = qi == 0 ? 0.0f
+                         : (q - copysign(bias, q)) *
+                               dequant[component * 64 + k];
+    }
+    float transformed[8];
+    idct8(input, transformed);
+    for (uint x = 0; x < 8; ++x) {
+      block[uint(lane) * 8 + x] = transformed[x];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane < 8) {
+    float input[8];
+    for (uint y = 0; y < 8; ++y) input[y] = block[y * 8 + uint(lane)];
+    float transformed[8];
+    idct8(input, transformed);
+    for (uint y = 0; y < 8; ++y) {
+      block[y * 8 + uint(lane)] = transformed[y];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void jpegli_idct_cooperative(
     device const short* coefficients [[buffer(0)]],
     device const float* dequant [[buffer(1)]],
     device const float* biases [[buffer(2)]],
     device float* planes [[buffer(3)]],
     constant DecodeParams& params [[buffer(4)]],
     constant uint& component [[buffer(5)]],
-    uint2 block_pos [[thread_position_in_grid]]) {
+    uint group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float blocks[4 * 64];
   const ComponentParams cp = params.comp[component];
-  if (block_pos.x >= cp.blocks_w || block_pos.y >= cp.blocks_h) return;
-  const uint block_index = block_pos.y * cp.blocks_w + block_pos.x;
-  const uint imcu = min(block_pos.y / cp.v_samp_factor,
-                        params.total_imcu_rows - 1);
-  float block[64];
-  for (uint k = 0; k < 64; ++k) {
-    const short qi = coefficients[cp.coeff_offset + block_index * 64 + k];
-    const float q = float(qi);
-    const float bias = biases[(component * params.total_imcu_rows + imcu) * 64 + k];
-    block[k] = qi == 0 ? 0.0f
-                       : (q - copysign(bias, q)) * dequant[component * 64 + k];
-  }
-  float horizontal[64];
-  for (uint y = 0; y < 8; ++y) {
-    float input[8];
-    float output[8];
-    for (uint x = 0; x < 8; ++x) input[x] = block[y * 8 + x];
-    idct8(input, output);
-    for (uint x = 0; x < 8; ++x) horizontal[y * 8 + x] = output[x];
-  }
-  const uint plane_width = cp.blocks_w * 8;
-  for (uint x = 0; x < 8; ++x) {
-    float input[8];
-    float output[8];
-    for (uint y = 0; y < 8; ++y) input[y] = horizontal[y * 8 + x];
-    idct8(input, output);
+  const uint block_index = group * 4 + uint(simdgroup);
+  const bool active = block_index < cp.blocks_w * cp.blocks_h;
+  reconstruct_block(coefficients, dequant, biases, params, component,
+                    block_index, active, lane,
+                    blocks + uint(simdgroup) * 64);
+  if (active && lane < 8) {
+    const uint block_x = block_index % cp.blocks_w;
+    const uint block_y = block_index / cp.blocks_w;
+    const uint plane_width = cp.blocks_w * 8;
     for (uint y = 0; y < 8; ++y) {
-      const uint px = block_pos.x * 8 + x;
-      const uint py = block_pos.y * 8 + y;
-      planes[cp.plane_offset + py * plane_width + px] = output[y];
+      const uint px = block_x * 8 + uint(lane);
+      const uint py = block_y * 8 + y;
+      planes[cp.plane_offset + py * plane_width + px] =
+          blocks[uint(simdgroup) * 64 + y * 8 + uint(lane)];
     }
   }
 }
@@ -254,14 +313,9 @@ inline uchar quantize(float centered) {
   return uchar(uint(rint(value)));
 }
 
-kernel void jpegli_convert(
-    device const float* planes [[buffer(0)]],
-    device uchar4* output [[buffer(1)]],
-    constant DecodeParams& params [[buffer(2)]],
-    uint2 pos [[thread_position_in_grid]]) {
-  if (pos.x >= params.width || pos.y >= params.height) return;
-  const bool fancy = params.fancy_upsampling != 0;
-  float c0 = sample_component(planes, params.comp[0], pos.x, pos.y, fancy);
+inline void write_color(texture2d<float, access::write> output, uint2 pos,
+                        float c0, float c1, float c2,
+                        constant DecodeParams& params) {
   float r;
   float g;
   float b;
@@ -269,22 +323,231 @@ kernel void jpegli_convert(
     r = c0;
     g = c0;
     b = c0;
-  } else {
-    const float c1 = sample_component(planes, params.comp[1], pos.x, pos.y, fancy);
-    const float c2 = sample_component(planes, params.comp[2], pos.x, pos.y, fancy);
-    if (params.jpeg_color_space == 3) {  // JCS_YCbCr
-      r = fma(as_type<float>(0x3fb374bcu), c2, c0);
-      g = fma(as_type<float>(0xbf36d1a2u), c2,
-              fma(as_type<float>(0xbeb032a1u), c1, c0));
-      b = fma(as_type<float>(0x3fe2d0e5u), c1, c0);
-    } else {  // JCS_RGB
-      r = c0;
-      g = c1;
-      b = c2;
+  } else if (params.jpeg_color_space == 3) {  // JCS_YCbCr
+    r = fma(as_type<float>(0x3fb374bcu), c2, c0);
+    g = fma(as_type<float>(0xbf36d1a2u), c2,
+            fma(as_type<float>(0xbeb032a1u), c1, c0));
+    b = fma(as_type<float>(0x3fe2d0e5u), c1, c0);
+  } else {  // JCS_RGB
+    r = c0;
+    g = c1;
+    b = c2;
+  }
+  const uchar4 rgba =
+      uchar4(quantize(r), quantize(g), quantize(b), uchar(255));
+  output.write(float4(rgba) * (1.0f / 255.0f), pos);
+}
+
+kernel void jpegli_convert(
+    device const float* planes [[buffer(0)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    constant DecodeParams& params [[buffer(2)]],
+    uint2 pos [[thread_position_in_grid]]) {
+  if (pos.x >= params.width || pos.y >= params.height) return;
+  const bool fancy = params.fancy_upsampling != 0;
+  float c0 = sample_component(planes, params.comp[0], pos.x, pos.y, fancy);
+  if (params.num_components == 1) {
+    write_color(output, pos, c0, 0.0f, 0.0f, params);
+    return;
+  }
+  const float c1 = sample_component(planes, params.comp[1], pos.x, pos.y, fancy);
+  const float c2 = sample_component(planes, params.comp[2], pos.x, pos.y, fancy);
+  write_color(output, pos, c0, c1, c2, params);
+}
+
+kernel void jpegli_reconstruct_gray(
+    device const short* coefficients [[buffer(0)]],
+    device const float* dequant [[buffer(1)]],
+    device const float* biases [[buffer(2)]],
+    constant DecodeParams& params [[buffer(4)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    uint2 block_pos [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+  threadgroup float block[64];
+  const ComponentParams cp = params.comp[0];
+  const bool active = block_pos.x < cp.blocks_w && block_pos.y < cp.blocks_h;
+  const uint block_index = block_pos.y * cp.blocks_w + block_pos.x;
+  reconstruct_block(coefficients, dequant, biases, params, 0, block_index,
+                    active, lane, block);
+  if (!active || lane >= 8) return;
+  for (uint y = 0; y < 8; ++y) {
+    const uint2 pos = uint2(block_pos.x * 8 + uint(lane),
+                            block_pos.y * 8 + y);
+    if (pos.x < params.width && pos.y < params.height) {
+      write_color(output, pos, block[y * 8 + uint(lane)], 0.0f, 0.0f,
+                  params);
     }
   }
-  output[pos.y * params.output_row_pixels + pos.x] =
-      uchar4(quantize(r), quantize(g), quantize(b), uchar(255));
+}
+
+kernel void jpegli_reconstruct_444(
+    device const short* coefficients [[buffer(0)]],
+    device const float* dequant [[buffer(1)]],
+    device const float* biases [[buffer(2)]],
+    constant DecodeParams& params [[buffer(4)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    uint2 block_pos [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+  threadgroup float blocks[3 * 64];
+  for (uint c = 0; c < 3; ++c) {
+    const ComponentParams cp = params.comp[c];
+    const bool active = block_pos.x < cp.blocks_w && block_pos.y < cp.blocks_h;
+    reconstruct_block(coefficients, dequant, biases, params, c,
+                      block_pos.y * cp.blocks_w + block_pos.x, active, lane,
+                      blocks + c * 64);
+  }
+  if (lane >= 8) return;
+  for (uint y = 0; y < 8; ++y) {
+    const uint2 pos = uint2(block_pos.x * 8 + uint(lane),
+                            block_pos.y * 8 + y);
+    if (pos.x < params.width && pos.y < params.height) {
+      const uint i = y * 8 + uint(lane);
+      write_color(output, pos, blocks[i], blocks[64 + i], blocks[128 + i],
+                  params);
+    }
+  }
+}
+
+kernel void jpegli_reconstruct_422_box(
+    device const short* coefficients [[buffer(0)]],
+    device const float* dequant [[buffer(1)]],
+    device const float* biases [[buffer(2)]],
+    constant DecodeParams& params [[buffer(4)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float blocks[4 * 64];
+  const uint ybx = tile.x * 2 + uint(simdgroup);
+  const uint yby = tile.y;
+  const ComponentParams ycp = params.comp[0];
+  const bool yactive = ybx < ycp.blocks_w && yby < ycp.blocks_h;
+  reconstruct_block(coefficients, dequant, biases, params, 0,
+                    yby * ycp.blocks_w + ybx, yactive, lane,
+                    blocks + uint(simdgroup) * 64);
+  const uint c = uint(simdgroup) + 1;
+  const ComponentParams cp = params.comp[c];
+  const bool cactive = tile.x < cp.blocks_w && tile.y < cp.blocks_h;
+  reconstruct_block(coefficients, dequant, biases, params, c,
+                    tile.y * cp.blocks_w + tile.x, cactive, lane,
+                    blocks + (2 + uint(simdgroup)) * 64);
+  for (uint index = tid; index < 128; index += 64) {
+    const uint x = index & 15;
+    const uint y = index >> 4;
+    const uint2 pos = uint2(tile.x * 16 + x, tile.y * 8 + y);
+    if (pos.x < params.width && pos.y < params.height) {
+      const uint yi = (x >> 3) * 64 + y * 8 + (x & 7);
+      const uint ci = y * 8 + (x >> 1);
+      write_color(output, pos, blocks[yi], blocks[128 + ci],
+                  blocks[192 + ci], params);
+    }
+  }
+}
+
+kernel void jpegli_reconstruct_420_box(
+    device const short* coefficients [[buffer(0)]],
+    device const float* dequant [[buffer(1)]],
+    device const float* biases [[buffer(2)]],
+    constant DecodeParams& params [[buffer(4)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float blocks[8 * 64];
+  const uint ybx = tile.x * 2 + (uint(simdgroup) & 1);
+  const uint yby = tile.y * 2 + (uint(simdgroup) >> 1);
+  const ComponentParams ycp = params.comp[0];
+  const bool yactive = ybx < ycp.blocks_w && yby < ycp.blocks_h;
+  reconstruct_block(coefficients, dequant, biases, params, 0,
+                    yby * ycp.blocks_w + ybx, yactive, lane,
+                    blocks + uint(simdgroup) * 64);
+  const bool chroma_group = simdgroup < 2;
+  const uint c = uint(simdgroup) + 1;
+  const ComponentParams cp = params.comp[min(c, 2u)];
+  const bool cactive = chroma_group && tile.x < cp.blocks_w &&
+                       tile.y < cp.blocks_h;
+  reconstruct_block(coefficients, dequant, biases, params, min(c, 2u),
+                    tile.y * cp.blocks_w + tile.x, cactive, lane,
+                    blocks + (4 + uint(simdgroup)) * 64);
+  for (uint index = tid; index < 256; index += 128) {
+    const uint x = index & 15;
+    const uint y = index >> 4;
+    const uint2 pos = uint2(tile.x * 16 + x, tile.y * 16 + y);
+    if (pos.x < params.width && pos.y < params.height) {
+      const uint yi = ((y >> 3) * 2 + (x >> 3)) * 64 +
+                      (y & 7) * 8 + (x & 7);
+      const uint ci = (y >> 1) * 8 + (x >> 1);
+      write_color(output, pos, blocks[yi], blocks[256 + ci],
+                  blocks[320 + ci], params);
+    }
+  }
+}
+
+kernel void jpegli_reconstruct_422_fancy(
+    device const short* coefficients [[buffer(0)]],
+    device const float* dequant [[buffer(1)]],
+    device const float* biases [[buffer(2)]],
+    device const float* planes [[buffer(3)]],
+    constant DecodeParams& params [[buffer(4)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float yblocks[2 * 64];
+  const uint ybx = tile.x * 2 + uint(simdgroup);
+  const uint yby = tile.y;
+  const ComponentParams ycp = params.comp[0];
+  const bool active = ybx < ycp.blocks_w && yby < ycp.blocks_h;
+  reconstruct_block(coefficients, dequant, biases, params, 0,
+                    yby * ycp.blocks_w + ybx, active, lane,
+                    yblocks + uint(simdgroup) * 64);
+  for (uint index = tid; index < 128; index += 64) {
+    const uint x = index & 15;
+    const uint y = index >> 4;
+    const uint2 pos = uint2(tile.x * 16 + x, tile.y * 8 + y);
+    if (pos.x < params.width && pos.y < params.height) {
+      const uint yi = (x >> 3) * 64 + y * 8 + (x & 7);
+      const float c1 = sample_component(planes, params.comp[1], pos.x, pos.y, true);
+      const float c2 = sample_component(planes, params.comp[2], pos.x, pos.y, true);
+      write_color(output, pos, yblocks[yi], c1, c2, params);
+    }
+  }
+}
+
+kernel void jpegli_reconstruct_420_fancy(
+    device const short* coefficients [[buffer(0)]],
+    device const float* dequant [[buffer(1)]],
+    device const float* biases [[buffer(2)]],
+    device const float* planes [[buffer(3)]],
+    constant DecodeParams& params [[buffer(4)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float yblocks[4 * 64];
+  const uint ybx = tile.x * 2 + (uint(simdgroup) & 1);
+  const uint yby = tile.y * 2 + (uint(simdgroup) >> 1);
+  const ComponentParams ycp = params.comp[0];
+  const bool active = ybx < ycp.blocks_w && yby < ycp.blocks_h;
+  reconstruct_block(coefficients, dequant, biases, params, 0,
+                    yby * ycp.blocks_w + ybx, active, lane,
+                    yblocks + uint(simdgroup) * 64);
+  for (uint index = tid; index < 256; index += 128) {
+    const uint x = index & 15;
+    const uint y = index >> 4;
+    const uint2 pos = uint2(tile.x * 16 + x, tile.y * 16 + y);
+    if (pos.x < params.width && pos.y < params.height) {
+      const uint yi = ((y >> 3) * 2 + (x >> 3)) * 64 +
+                      (y & 7) * 8 + (x & 7);
+      const float c1 = sample_component(planes, params.comp[1], pos.x, pos.y, true);
+      const float c2 = sample_component(planes, params.comp[2], pos.x, pos.y, true);
+      write_color(output, pos, yblocks[yi], c1, c2, params);
+    }
+  }
 }
 )metal";
 
@@ -325,11 +588,9 @@ class MetalContext {
     NSError* ns_error = nil;
 #if defined(JPEGLI_APPLE_METAL_PRECOMPILED_LIBRARY)
     dispatch_data_t library_data =
-        dispatch_data_create(kJpegliAppleMetalLibraryBytes,
-                             sizeof(kJpegliAppleMetalLibraryBytes), nullptr,
-                             DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-    context->library_ =
-        [context->device_ newLibraryWithData:library_data error:&ns_error];
+        dispatch_data_create(kJpegliAppleMetalLibraryBytes, sizeof(kJpegliAppleMetalLibraryBytes),
+                             nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    context->library_ = [context->device_ newLibraryWithData:library_data error:&ns_error];
 #endif
     if (context->library_ == nil) {
       MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
@@ -349,22 +610,6 @@ class MetalContext {
     }
     if (context->library_ == nil) {
       *error = "Metal shader compilation failed: " +
-               std::string(ns_error.localizedDescription.UTF8String ?: "unknown error");
-      return nullptr;
-    }
-    id<MTLFunction> idct = [context->library_ newFunctionWithName:@"jpegli_idct"];
-    id<MTLFunction> convert = [context->library_ newFunctionWithName:@"jpegli_convert"];
-    context->idct_pipeline_ = [context->device_ newComputePipelineStateWithFunction:idct
-                                                                              error:&ns_error];
-    if (context->idct_pipeline_ == nil) {
-      *error = "Metal IDCT pipeline creation failed: " +
-               std::string(ns_error.localizedDescription.UTF8String ?: "unknown error");
-      return nullptr;
-    }
-    context->convert_pipeline_ = [context->device_ newComputePipelineStateWithFunction:convert
-                                                                                 error:&ns_error];
-    if (context->convert_pipeline_ == nil) {
-      *error = "Metal conversion pipeline creation failed: " +
                std::string(ns_error.localizedDescription.UTF8String ?: "unknown error");
       return nullptr;
     }
@@ -405,18 +650,20 @@ class MetalContext {
       }
       cached_ = {};
     }
-    result->coefficients = [device_
-        newBufferWithLength:coefficient_size
-                    options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+    result->coefficients = [device_ newBufferWithLength:coefficient_size
+                                                options:MTLResourceStorageModeShared];
     result->dequant = [device_
         newBufferWithLength:dequant_size
                     options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
     result->biases = [device_
         newBufferWithLength:bias_size
                     options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
-    result->planes = [device_ newBufferWithLength:plane_size options:MTLResourceStorageModeShared];
+    if (plane_size != 0) {
+      result->planes = [device_ newBufferWithLength:plane_size
+                                            options:MTLResourceStorageModeShared];
+    }
     if (result->coefficients == nil || result->dequant == nil || result->biases == nil ||
-        result->planes == nil) {
+        (plane_size != 0 && result->planes == nil)) {
       *result = {};
       *error = "Metal buffer allocation failed";
       return false;
@@ -443,8 +690,26 @@ class MetalContext {
 
   id<MTLDevice> device() const { return device_; }
   id<MTLCommandQueue> queue() const { return queue_; }
-  id<MTLComputePipelineState> idct_pipeline() const { return idct_pipeline_; }
-  id<MTLComputePipelineState> convert_pipeline() const { return convert_pipeline_; }
+  id<MTLComputePipelineState> Pipeline(PipelineKind kind, uint64_t* initialization_ns,
+                                       std::string* error) {
+    const size_t index = static_cast<size_t>(kind);
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    if (pipelines_[index] != nil) return pipelines_[index];
+    const uint64_t start = NowNs();
+    NSError* ns_error = nil;
+    id<MTLFunction> function = [library_ newFunctionWithName:@(kPipelineNames[index])];
+    if (function == nil) {
+      *error = std::string("Metal function is unavailable: ") + kPipelineNames[index];
+      return nil;
+    }
+    pipelines_[index] = [device_ newComputePipelineStateWithFunction:function error:&ns_error];
+    *initialization_ns += NowNs() - start;
+    if (pipelines_[index] == nil) {
+      *error = "Metal pipeline creation failed: " +
+               std::string(ns_error.localizedDescription.UTF8String ?: "unknown error");
+    }
+    return pipelines_[index];
+  }
   id<MTLCounterSampleBuffer> timestamp_samples() const { return timestamp_samples_; }
   std::mutex& command_mutex() { return command_mutex_; }
 
@@ -452,10 +717,10 @@ class MetalContext {
   id<MTLDevice> device_;
   id<MTLCommandQueue> queue_;
   id<MTLLibrary> library_;
-  id<MTLComputePipelineState> idct_pipeline_;
-  id<MTLComputePipelineState> convert_pipeline_;
+  id<MTLComputePipelineState> pipelines_[static_cast<size_t>(PipelineKind::kCount)] = {};
   id<MTLCounterSampleBuffer> timestamp_samples_;
   std::mutex command_mutex_;
+  std::mutex pipeline_mutex_;
   std::mutex scratch_mutex_;
   ScratchBuffers cached_;
 };
@@ -483,14 +748,49 @@ struct DecoderState {
   ScratchBuffers scratch;
   id<MTLBuffer> output;
   id<MTLTexture> texture;
+  id<MTLCommandBuffer> external_command;
+  bool encoded_into_external_command = false;
   DecodeParams params = {};
   size_t output_row_bytes = 0;
 };
 
 struct OutputHandle {
+  ~OutputHandle() {
+    // Never return pending command resources to the reusable cache. Metal
+    // retains referenced resources until execution completes, and dropping
+    // this private copy avoids both a wait and premature scratch reuse.
+    if (context && scratch.coefficients != nil &&
+        (command == nil || command.status == MTLCommandBufferStatusCompleted)) {
+      context->Return(std::move(scratch));
+    }
+  }
   id<MTLBuffer> buffer;
   id<MTLTexture> texture;
+  id<MTLCommandBuffer> command;
+  std::shared_ptr<MetalContext> context;
+  ScratchBuffers scratch;
 };
+
+KernelVariant ClassifyVariant(j_decompress_ptr cinfo) {
+  const jpeg_decomp_master* m = cinfo->master;
+  if (cinfo->num_components == 1 && m->h_factor[0] == 1 && m->v_factor[0] == 1) {
+    return KernelVariant::kGrayscale;
+  }
+  if (cinfo->num_components != 3) return KernelVariant::kLegacy;
+  if (m->h_factor[0] != 1 || m->v_factor[0] != 1) {
+    return KernelVariant::kLegacy;
+  }
+  if (m->h_factor[1] == 1 && m->v_factor[1] == 1 && m->h_factor[2] == 1 && m->v_factor[2] == 1) {
+    return KernelVariant::k444;
+  }
+  if (m->h_factor[1] == 2 && m->v_factor[1] == 1 && m->h_factor[2] == 2 && m->v_factor[2] == 1) {
+    return KernelVariant::k422;
+  }
+  if (m->h_factor[1] == 2 && m->v_factor[1] == 2 && m->h_factor[2] == 2 && m->v_factor[2] == 2) {
+    return KernelVariant::k420;
+  }
+  return KernelVariant::kLegacy;
+}
 
 bool BasicEligibility(j_decompress_ptr cinfo, bool direct_output, const char** reason) {
   jpeg_decomp_master* m = cinfo->master;
@@ -573,13 +873,12 @@ void ComputeBiases(j_decompress_ptr cinfo, float* output) {
     for (size_t imcu = 0; imcu < rows; ++imcu) {
       const size_t by0 = imcu * comp.v_samp_factor;
       const size_t nrows = std::min<size_t>(comp.v_samp_factor, comp.height_in_blocks - by0);
-      JBLOCKARRAY blocks = (*cinfo->mem->access_virt_barray)(reinterpret_cast<j_common_ptr>(cinfo),
-                                                             m->coef_arrays[c], by0, nrows, FALSE);
-      for (size_t iy = 0; iy < nrows; ++iy) {
-        const int16_t* coeff = &blocks[iy][0][0];
-        GatherBlockStats(coeff, comp.width_in_blocks * DCTSIZE2, nonzeros.data(), sumabs.data());
-        num_blocks += comp.width_in_blocks;
+      const size_t base = (static_cast<size_t>(c) * rows + imcu) * DCTSIZE2;
+      for (size_t k = 0; k < DCTSIZE2; ++k) {
+        nonzeros[k] += m->apple_metal_row_nonzeros_[base + k];
+        sumabs[k] += m->apple_metal_row_sumabs_[base + k];
       }
+      num_blocks += nrows * comp.width_in_blocks;
       if ((imcu & 3) == 3) {
         ComputeOptimalLaplacianBiases(static_cast<int>(num_blocks), nonzeros.data(), sumabs.data(),
                                       biases.data());
@@ -601,6 +900,8 @@ bool FillParamsAndSizes(j_decompress_ptr cinfo, DecodeParams* params, size_t* co
   params->jpeg_color_space = cinfo->jpeg_color_space;
   params->fancy_upsampling = cinfo->do_fancy_upsampling ? 1 : 0;
   params->total_imcu_rows = cinfo->total_iMCU_rows;
+  const KernelVariant variant = ClassifyVariant(cinfo);
+  params->variant = static_cast<uint32_t>(variant);
   size_t coeff_total = 0;
   size_t plane_total = 0;
   for (int c = 0; c < cinfo->num_components; ++c) {
@@ -628,8 +929,13 @@ bool FillParamsAndSizes(j_decompress_ptr cinfo, DecodeParams* params, size_t* co
     cp.h_factor = m->h_factor[c];
     cp.v_factor = m->v_factor[c];
     cp.v_samp_factor = comp.v_samp_factor;
+    const bool legacy_plane = variant == KernelVariant::kLegacy;
+    const bool fancy_chroma_plane =
+        c > 0 && cinfo->do_fancy_upsampling &&
+        (variant == KernelVariant::k422 || variant == KernelVariant::k420);
     if (!SafeAdd(coeff_total, coeff_count, &coeff_total) ||
-        !SafeAdd(plane_total, plane_count, &plane_total)) {
+        ((legacy_plane || fancy_chroma_plane) &&
+         !SafeAdd(plane_total, plane_count, &plane_total))) {
       *error = "Metal aggregate plane size overflow";
       return false;
     }
@@ -650,8 +956,8 @@ bool FillParamsAndSizes(j_decompress_ptr cinfo, DecodeParams* params, size_t* co
   *plane_size = AlignUp(plane_bytes, kMetalAlignment);
   *bias_size = AlignUp(*bias_size, kMetalAlignment);
   *output_row_bytes = AlignUp(static_cast<size_t>(cinfo->output_width) * 4, kMetalAlignment);
-  if (*coefficient_size == 0 || *dequant_size == 0 || *plane_size == 0 || *bias_size == 0 ||
-      *output_row_bytes == 0 || !SafeMul(*output_row_bytes, cinfo->output_height, output_size)) {
+  if (*coefficient_size == 0 || *dequant_size == 0 || *bias_size == 0 || *output_row_bytes == 0 ||
+      !SafeMul(*output_row_bytes, cinfo->output_height, output_size)) {
     *error = "Metal aligned size overflow";
     return false;
   }
@@ -664,24 +970,6 @@ bool FillParamsAndSizes(j_decompress_ptr cinfo, DecodeParams* params, size_t* co
     return false;
   }
   return true;
-}
-
-void CopyCoefficients(j_decompress_ptr cinfo, const DecodeParams& params, int16_t* destination) {
-  jpeg_decomp_master* m = cinfo->master;
-  for (int c = 0; c < cinfo->num_components; ++c) {
-    const jpeg_component_info& comp = cinfo->comp_info[c];
-    int16_t* dst = destination + params.comp[c].coeff_offset;
-    for (size_t by = 0; by < comp.height_in_blocks;) {
-      const size_t rows = std::min<size_t>(comp.v_samp_factor, comp.height_in_blocks - by);
-      JBLOCKARRAY blocks = (*cinfo->mem->access_virt_barray)(reinterpret_cast<j_common_ptr>(cinfo),
-                                                             m->coef_arrays[c], by, rows, FALSE);
-      const size_t row_bytes = static_cast<size_t>(comp.width_in_blocks) * sizeof(JBLOCK);
-      for (size_t iy = 0; iy < rows; ++iy) {
-        memcpy(dst + (by + iy) * comp.width_in_blocks * DCTSIZE2, &blocks[iy][0][0], row_bytes);
-      }
-      by += rows;
-    }
-  }
 }
 
 bool CompleteCommandBuffer(id<MTLCommandBuffer> command_buffer, uint64_t wall_start,
@@ -729,6 +1017,58 @@ bool AppleMetalShouldAttempt(j_decompress_ptr cinfo, bool direct_output) {
   return true;
 }
 
+bool AppleMetalPrepareCoefficientStorage(j_decompress_ptr cinfo) {
+  @autoreleasepool {
+    jpeg_decomp_master* m = cinfo->master;
+    if (m->apple_metal_decoder_ != nullptr) return true;
+    std::string error;
+    uint64_t initialization_ns = 0;
+    std::shared_ptr<MetalContext> context = GetContext(&initialization_ns, &error);
+    m->apple_metal_stats_.metal_initialization_ns += initialization_ns;
+    if (!context) {
+      SetAppleMetalFallbackReason(cinfo, error.c_str());
+      return false;
+    }
+    std::unique_ptr<DecoderState> state(new (std::nothrow) DecoderState());
+    if (!state) {
+      SetAppleMetalFallbackReason(cinfo, "unable to allocate Metal decoder state");
+      return false;
+    }
+    state->context = context;
+    size_t coefficient_size = 0;
+    size_t dequant_size = 0;
+    size_t bias_size = 0;
+    size_t plane_size = 0;
+    size_t output_size = 0;
+    if (!FillParamsAndSizes(cinfo, &state->params, &coefficient_size, &dequant_size, &bias_size,
+                            &plane_size, &output_size, &state->output_row_bytes, &error) ||
+        !context->Acquire(coefficient_size, dequant_size, bias_size, plane_size, &state->scratch,
+                          &error)) {
+      SetAppleMetalFallbackReason(cinfo, error.c_str());
+      return false;
+    }
+    memset(state->scratch.coefficients.contents, 0, coefficient_size);
+    const size_t stat_count =
+        static_cast<size_t>(cinfo->num_components) * cinfo->total_iMCU_rows * DCTSIZE2;
+    m->apple_metal_row_nonzeros_.assign(stat_count, 0);
+    m->apple_metal_row_sumabs_.assign(stat_count, 0);
+    m->apple_metal_bias_stats_enabled_ = true;
+    m->apple_metal_decoder_ = state.release();
+    return true;
+  }
+}
+
+JBLOCK* AppleMetalCoefficientPlane(j_decompress_ptr cinfo, int component) {
+  if (cinfo == nullptr || cinfo->master == nullptr || component < 0 ||
+      component >= cinfo->num_components) {
+    return nullptr;
+  }
+  DecoderState* state = static_cast<DecoderState*>(cinfo->master->apple_metal_decoder_);
+  if (state == nullptr || state->scratch.coefficients == nil) return nullptr;
+  JCOEF* coefficients = static_cast<JCOEF*>(state->scratch.coefficients.contents);
+  return reinterpret_cast<JBLOCK*>(coefficients + state->params.comp[component].coeff_offset);
+}
+
 bool AppleMetalReconstruct(j_decompress_ptr cinfo, bool direct_output) {
   @autoreleasepool {
     jpeg_decomp_master* m = cinfo->master;
@@ -745,162 +1085,277 @@ bool AppleMetalReconstruct(j_decompress_ptr cinfo, bool direct_output) {
     }
 
     std::string error;
-    uint64_t initialization_ns = 0;
-    std::shared_ptr<MetalContext> context = GetContext(&initialization_ns, &error);
-    m->apple_metal_stats_.metal_initialization_ns = initialization_ns;
-    if (!context) {
-      SetAppleMetalFallbackReason(cinfo, error.c_str());
+    DecoderState* state = static_cast<DecoderState*>(m->apple_metal_decoder_);
+    if (state == nullptr || state->context == nullptr || state->scratch.coefficients == nil) {
+      SetAppleMetalFallbackReason(cinfo, "shared Metal coefficient storage was not prepared");
       return false;
     }
-
-    std::unique_ptr<DecoderState> state(new (std::nothrow) DecoderState());
-    if (!state) {
-      SetAppleMetalFallbackReason(cinfo, "unable to allocate Metal decoder state");
-      return false;
-    }
-    state->context = context;
+    std::shared_ptr<MetalContext> context = state->context;
     size_t coefficient_size = 0;
     size_t dequant_size = 0;
     size_t bias_size = 0;
     size_t plane_size = 0;
     size_t output_size = 0;
-    if (!FillParamsAndSizes(cinfo, &state->params, &coefficient_size, &dequant_size, &bias_size,
-                            &plane_size, &output_size, &state->output_row_bytes, &error)) {
+    DecodeParams checked_params = {};
+    size_t checked_row_bytes = 0;
+    if (!FillParamsAndSizes(cinfo, &checked_params, &coefficient_size, &dequant_size, &bias_size,
+                            &plane_size, &output_size, &checked_row_bytes, &error)) {
       SetAppleMetalFallbackReason(cinfo, error.c_str());
       return false;
     }
-    if (!context->Acquire(coefficient_size, dequant_size, bias_size, plane_size, &state->scratch,
-                          &error)) {
-      SetAppleMetalFallbackReason(cinfo, error.c_str());
-      return false;
-    }
-    state->output = [context->device() newBufferWithLength:output_size
-                                                   options:MTLResourceStorageModeShared];
-    if (state->output == nil) {
-      SetAppleMetalFallbackReason(cinfo, "Metal output buffer allocation failed");
-      return false;
-    }
-    MTLTextureDescriptor* descriptor =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                           width:cinfo->output_width
-                                                          height:cinfo->output_height
-                                                       mipmapped:NO];
-    descriptor.usage = MTLTextureUsageShaderRead;
-    descriptor.storageMode = MTLStorageModeShared;
-    state->texture = [state->output newTextureWithDescriptor:descriptor
-                                                      offset:0
-                                                 bytesPerRow:state->output_row_bytes];
-    if (state->texture == nil) {
-      SetAppleMetalFallbackReason(cinfo, "unable to create RGBA8 Metal texture view");
-      return false;
+    state->params = checked_params;
+    state->output_row_bytes = checked_row_bytes;
+
+    const bool caller_command =
+        m->apple_metal_command_buffer_ != nullptr || m->apple_metal_destination_texture_ != nullptr;
+    id<MTLCommandBuffer> command = nil;
+    if (caller_command) {
+      if (m->apple_metal_command_buffer_ == nullptr ||
+          m->apple_metal_destination_texture_ == nullptr) {
+        SetAppleMetalFallbackReason(cinfo, "caller Metal destination is incomplete");
+        return false;
+      }
+      command = (__bridge id<MTLCommandBuffer>)m->apple_metal_command_buffer_;
+      state->texture = (__bridge id<MTLTexture>)m->apple_metal_destination_texture_;
+      if (command.device != context->device() || state->texture.device != context->device()) {
+        SetAppleMetalFallbackReason(cinfo,
+                                    "caller command buffer and texture use a different device");
+        return false;
+      }
+      if (command.status != MTLCommandBufferStatusNotEnqueued) {
+        SetAppleMetalFallbackReason(cinfo, "caller command buffer is already enqueued");
+        return false;
+      }
+      if (state->texture.pixelFormat != MTLPixelFormatRGBA8Unorm ||
+          state->texture.width != cinfo->output_width ||
+          state->texture.height != cinfo->output_height ||
+          (state->texture.usage & MTLTextureUsageShaderWrite) == 0) {
+        SetAppleMetalFallbackReason(cinfo, "caller texture must be exact-size writable RGBA8Unorm");
+        return false;
+      }
+    } else {
+      state->output = [context->device() newBufferWithLength:output_size
+                                                     options:MTLResourceStorageModeShared];
+      if (state->output == nil) {
+        SetAppleMetalFallbackReason(cinfo, "Metal output buffer allocation failed");
+        return false;
+      }
+      MTLTextureDescriptor* descriptor =
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                             width:cinfo->output_width
+                                                            height:cinfo->output_height
+                                                         mipmapped:NO];
+      descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      descriptor.storageMode = MTLStorageModeShared;
+      state->texture = [state->output newTextureWithDescriptor:descriptor
+                                                        offset:0
+                                                   bytesPerRow:state->output_row_bytes];
+      if (state->texture == nil) {
+        SetAppleMetalFallbackReason(cinfo, "unable to create RGBA8 Metal texture view");
+        return false;
+      }
     }
 
     const uint64_t analysis_start = NowNs();
     ComputeBiases(cinfo, static_cast<float*>(state->scratch.biases.contents));
     m->apple_metal_stats_.coefficient_analysis_ns = NowNs() - analysis_start;
 
-    const uint64_t copy_start = NowNs();
-    CopyCoefficients(cinfo, state->params,
-                     static_cast<int16_t*>(state->scratch.coefficients.contents));
     memcpy(state->scratch.dequant.contents, m->dequant_,
            static_cast<size_t>(cinfo->num_components) * DCTSIZE2 * sizeof(float));
-    m->apple_metal_stats_.coefficient_copy_ns = NowNs() - copy_start;
+    m->apple_metal_stats_.coefficient_copy_ns = 0;
+
+    const KernelVariant variant = static_cast<KernelVariant>(state->params.variant);
+    const bool separate_plane_pass =
+        variant == KernelVariant::kLegacy ||
+        (cinfo->do_fancy_upsampling &&
+         (variant == KernelVariant::k422 || variant == KernelVariant::k420));
+    PipelineKind reconstruction_kind = PipelineKind::kLegacyConvert;
+    switch (variant) {
+      case KernelVariant::kGrayscale:
+        reconstruction_kind = PipelineKind::kGrayscale;
+        break;
+      case KernelVariant::k444:
+        reconstruction_kind = PipelineKind::k444;
+        break;
+      case KernelVariant::k422:
+        reconstruction_kind =
+            cinfo->do_fancy_upsampling ? PipelineKind::k422Fancy : PipelineKind::k422Box;
+        break;
+      case KernelVariant::k420:
+        reconstruction_kind =
+            cinfo->do_fancy_upsampling ? PipelineKind::k420Fancy : PipelineKind::k420Box;
+        break;
+      case KernelVariant::kLegacy:
+        break;
+    }
+    uint64_t pipeline_initialization_ns = 0;
+    id<MTLComputePipelineState> idct_pipeline = nil;
+    if (separate_plane_pass) {
+      idct_pipeline =
+          context->Pipeline(PipelineKind::kCooperativeIdct, &pipeline_initialization_ns, &error);
+      if (idct_pipeline == nil) {
+        SetAppleMetalFallbackReason(cinfo, error.c_str());
+        return false;
+      }
+    }
+    id<MTLComputePipelineState> reconstruction_pipeline =
+        context->Pipeline(reconstruction_kind, &pipeline_initialization_ns, &error);
+    m->apple_metal_stats_.metal_initialization_ns += pipeline_initialization_ns;
+    if (reconstruction_pipeline == nil) {
+      SetAppleMetalFallbackReason(cinfo, error.c_str());
+      return false;
+    }
 
     uint64_t encode_ns = 0;
     uint64_t overhead_ns = 0;
     uint64_t idct_gpu_ns = 0;
     uint64_t color_gpu_ns = 0;
     uint64_t total_gpu_ns = 0;
-    std::unique_lock<std::mutex> command_lock(context->command_mutex());
-    id<MTLCounterSampleBuffer> timestamp_samples = context->timestamp_samples();
+    std::unique_lock<std::mutex> command_lock;
+    if (!caller_command) {
+      command_lock = std::unique_lock<std::mutex>(context->command_mutex());
+    }
+    id<MTLCounterSampleBuffer> timestamp_samples =
+        caller_command ? nil : context->timestamp_samples();
     const uint64_t encode_start = NowNs();
-    id<MTLCommandBuffer> command = [context->queue() commandBuffer];
-    MTLComputePassDescriptor* idct_pass = nil;
+    if (!caller_command) command = [context->queue() commandBuffer];
+    if (command == nil) {
+      SetAppleMetalFallbackReason(cinfo, "unable to create Metal command buffer");
+      return false;
+    }
+    if (separate_plane_pass) {
+      MTLComputePassDescriptor* idct_pass = nil;
+      if (timestamp_samples != nil) {
+        idct_pass = [MTLComputePassDescriptor computePassDescriptor];
+        MTLComputePassSampleBufferAttachmentDescriptor* attachment =
+            idct_pass.sampleBufferAttachments[0];
+        attachment.sampleBuffer = timestamp_samples;
+        attachment.startOfEncoderSampleIndex = 0;
+        attachment.endOfEncoderSampleIndex = 1;
+      }
+      id<MTLComputeCommandEncoder> idct_encoder =
+          idct_pass == nil ? [command computeCommandEncoder]
+                           : [command computeCommandEncoderWithDescriptor:idct_pass];
+      [idct_encoder setComputePipelineState:idct_pipeline];
+      [idct_encoder setBuffer:state->scratch.coefficients offset:0 atIndex:0];
+      [idct_encoder setBuffer:state->scratch.dequant offset:0 atIndex:1];
+      [idct_encoder setBuffer:state->scratch.biases offset:0 atIndex:2];
+      [idct_encoder setBuffer:state->scratch.planes offset:0 atIndex:3];
+      [idct_encoder setBytes:&state->params length:sizeof(state->params) atIndex:4];
+      const uint32_t begin_component = variant == KernelVariant::kLegacy ? 0 : 1;
+      for (uint32_t c = begin_component; c < state->params.num_components; ++c) {
+        [idct_encoder setBytes:&c length:sizeof(c) atIndex:5];
+        const uint64_t blocks =
+            static_cast<uint64_t>(state->params.comp[c].blocks_w) * state->params.comp[c].blocks_h;
+        [idct_encoder dispatchThreadgroups:MTLSizeMake((blocks + 3) / 4, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      }
+      [idct_encoder endEncoding];
+    }
+    MTLComputePassDescriptor* reconstruction_pass = nil;
     if (timestamp_samples != nil) {
-      idct_pass = [MTLComputePassDescriptor computePassDescriptor];
+      reconstruction_pass = [MTLComputePassDescriptor computePassDescriptor];
       MTLComputePassSampleBufferAttachmentDescriptor* attachment =
-          idct_pass.sampleBufferAttachments[0];
+          reconstruction_pass.sampleBufferAttachments[0];
       attachment.sampleBuffer = timestamp_samples;
-      attachment.startOfEncoderSampleIndex = 0;
-      attachment.endOfEncoderSampleIndex = 1;
+      attachment.startOfEncoderSampleIndex = separate_plane_pass ? 2 : 0;
+      attachment.endOfEncoderSampleIndex = separate_plane_pass ? 3 : 1;
     }
-    id<MTLComputeCommandEncoder> idct_encoder =
-        idct_pass == nil ? [command computeCommandEncoder]
-                         : [command computeCommandEncoderWithDescriptor:idct_pass];
-    [idct_encoder setComputePipelineState:context->idct_pipeline()];
-    [idct_encoder setBuffer:state->scratch.coefficients offset:0 atIndex:0];
-    [idct_encoder setBuffer:state->scratch.dequant offset:0 atIndex:1];
-    [idct_encoder setBuffer:state->scratch.biases offset:0 atIndex:2];
-    [idct_encoder setBuffer:state->scratch.planes offset:0 atIndex:3];
-    [idct_encoder setBytes:&state->params length:sizeof(state->params) atIndex:4];
-    const MTLSize block_threads = MTLSizeMake(8, 8, 1);
-    for (uint32_t c = 0; c < state->params.num_components; ++c) {
-      [idct_encoder setBytes:&c length:sizeof(c) atIndex:5];
-      [idct_encoder dispatchThreads:MTLSizeMake(state->params.comp[c].blocks_w,
-                                                state->params.comp[c].blocks_h, 1)
-              threadsPerThreadgroup:block_threads];
+    id<MTLComputeCommandEncoder> encoder =
+        reconstruction_pass == nil
+            ? [command computeCommandEncoder]
+            : [command computeCommandEncoderWithDescriptor:reconstruction_pass];
+    [encoder setComputePipelineState:reconstruction_pipeline];
+    if (variant == KernelVariant::kLegacy) {
+      [encoder setBuffer:state->scratch.planes offset:0 atIndex:0];
+      [encoder setBytes:&state->params length:sizeof(state->params) atIndex:2];
+    } else {
+      [encoder setBuffer:state->scratch.coefficients offset:0 atIndex:0];
+      [encoder setBuffer:state->scratch.dequant offset:0 atIndex:1];
+      [encoder setBuffer:state->scratch.biases offset:0 atIndex:2];
+      if (state->scratch.planes != nil) {
+        [encoder setBuffer:state->scratch.planes offset:0 atIndex:3];
+      }
+      [encoder setBytes:&state->params length:sizeof(state->params) atIndex:4];
     }
-    [idct_encoder endEncoding];
-    MTLComputePassDescriptor* color_pass = nil;
-    if (timestamp_samples != nil) {
-      color_pass = [MTLComputePassDescriptor computePassDescriptor];
-      MTLComputePassSampleBufferAttachmentDescriptor* attachment =
-          color_pass.sampleBufferAttachments[0];
-      attachment.sampleBuffer = timestamp_samples;
-      attachment.startOfEncoderSampleIndex = 2;
-      attachment.endOfEncoderSampleIndex = 3;
+    [encoder setTexture:state->texture atIndex:0];
+    switch (variant) {
+      case KernelVariant::kLegacy:
+        [encoder dispatchThreads:MTLSizeMake(cinfo->output_width, cinfo->output_height, 1)
+            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        break;
+      case KernelVariant::kGrayscale:
+      case KernelVariant::k444:
+        [encoder dispatchThreadgroups:MTLSizeMake(state->params.comp[0].blocks_w,
+                                                  state->params.comp[0].blocks_h, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        break;
+      case KernelVariant::k422:
+        [encoder dispatchThreadgroups:MTLSizeMake((cinfo->output_width + 15) / 16,
+                                                  (cinfo->output_height + 7) / 8, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        break;
+      case KernelVariant::k420:
+        [encoder dispatchThreadgroups:MTLSizeMake((cinfo->output_width + 15) / 16,
+                                                  (cinfo->output_height + 15) / 16, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        break;
     }
-    id<MTLComputeCommandEncoder> color_encoder =
-        color_pass == nil ? [command computeCommandEncoder]
-                          : [command computeCommandEncoderWithDescriptor:color_pass];
-    [color_encoder setComputePipelineState:context->convert_pipeline()];
-    [color_encoder setBuffer:state->scratch.planes offset:0 atIndex:0];
-    [color_encoder setBuffer:state->output offset:0 atIndex:1];
-    [color_encoder setBytes:&state->params length:sizeof(state->params) atIndex:2];
-    [color_encoder dispatchThreads:MTLSizeMake(cinfo->output_width, cinfo->output_height, 1)
-             threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-    [color_encoder endEncoding];
+    [encoder endEncoding];
     encode_ns = NowNs() - encode_start;
-    if (!CompleteCommandBuffer(command, NowNs(), &total_gpu_ns, &overhead_ns, &error)) {
+    if (caller_command) {
+      state->external_command = command;
+      state->encoded_into_external_command = true;
+    } else if (!CompleteCommandBuffer(command, NowNs(), &total_gpu_ns, &overhead_ns, &error)) {
       SetAppleMetalFallbackReason(cinfo, error.c_str());
       return false;
     }
-    if (timestamp_samples != nil && total_gpu_ns != 0) {
+    if (!caller_command && timestamp_samples != nil && total_gpu_ns != 0) {
       NSData* resolved = [timestamp_samples resolveCounterRange:NSMakeRange(0, 4)];
       if (resolved.length >= 4 * sizeof(MTLCounterResultTimestamp)) {
         const MTLCounterResultTimestamp* timestamps =
             static_cast<const MTLCounterResultTimestamp*>(resolved.bytes);
         const uint64_t begin = timestamps[0].timestamp;
         const uint64_t idct_end = timestamps[1].timestamp;
-        const uint64_t color_begin = timestamps[2].timestamp;
-        const uint64_t end = timestamps[3].timestamp;
+        const uint64_t color_begin = separate_plane_pass ? timestamps[2].timestamp : begin;
+        const uint64_t end = separate_plane_pass ? timestamps[3].timestamp : idct_end;
         if (begin != MTLCounterErrorValue && idct_end != MTLCounterErrorValue &&
             color_begin != MTLCounterErrorValue && end != MTLCounterErrorValue && end > begin &&
             idct_end >= begin && end >= color_begin) {
           const double nanoseconds_per_tick =
               static_cast<double>(total_gpu_ns) / static_cast<double>(end - begin);
-          idct_gpu_ns =
-              static_cast<uint64_t>(static_cast<double>(idct_end - begin) * nanoseconds_per_tick);
-          color_gpu_ns =
-              static_cast<uint64_t>(static_cast<double>(end - color_begin) * nanoseconds_per_tick);
+          if (separate_plane_pass) {
+            idct_gpu_ns =
+                static_cast<uint64_t>(static_cast<double>(idct_end - begin) * nanoseconds_per_tick);
+            color_gpu_ns = static_cast<uint64_t>(static_cast<double>(end - color_begin) *
+                                                 nanoseconds_per_tick);
+          }
         }
       }
     }
-    command_lock.unlock();
+    if (command_lock.owns_lock()) command_lock.unlock();
     m->apple_metal_stats_.command_encoding_ns = encode_ns;
     m->apple_metal_stats_.submission_overhead_ns = overhead_ns;
     m->apple_metal_stats_.gpu_dequant_idct_ns = idct_gpu_ns;
     m->apple_metal_stats_.gpu_upsample_color_ns = color_gpu_ns;
+    m->apple_metal_stats_.gpu_fused_reconstruction_ns =
+        separate_plane_pass ? color_gpu_ns : total_gpu_ns;
     m->apple_metal_stats_.cpu_decoder_bytes =
-        MemoryManagerCurrentBytes(reinterpret_cast<j_common_ptr>(cinfo));
-    m->apple_metal_stats_.metal_buffer_bytes = state->scratch.Capacity() + output_size;
+        MemoryManagerCurrentBytes(reinterpret_cast<j_common_ptr>(cinfo)) +
+        (m->apple_metal_row_nonzeros_.capacity() + m->apple_metal_row_sumabs_.capacity()) *
+            sizeof(int);
+    m->apple_metal_stats_.metal_buffer_bytes =
+        state->scratch.Capacity() + (caller_command ? 0 : output_size);
     m->apple_metal_stats_.decoder_retained_bytes =
         m->apple_metal_stats_.cpu_decoder_bytes + m->apple_metal_stats_.metal_buffer_bytes;
     m->apple_metal_stats_.reconstruction_total_ns = NowNs() - total_start;
     m->apple_metal_stats_.used_metal = 1;
     m->apple_metal_stats_.direct_output = direct_output ? 1 : 0;
+    m->apple_metal_stats_.unified_coefficient_bytes = coefficient_size;
+    m->apple_metal_stats_.float_plane_bytes = plane_size;
+    m->apple_metal_stats_.fused_pipeline = variant == KernelVariant::kLegacy ? 0 : 1;
+    m->apple_metal_stats_.caller_command_buffer = caller_command ? 1 : 0;
     SetAppleMetalFallbackReason(cinfo, "");
-    m->apple_metal_decoder_ = state.release();
     return true;
   }
 }
@@ -933,19 +1388,25 @@ JDIMENSION AppleMetalReadScanlines(j_decompress_ptr cinfo, JSAMPARRAY scanlines,
 
 bool AppleMetalExportOutput(j_decompress_ptr cinfo, JpegliAppleMetalOutput* output) {
   DecoderState* state = static_cast<DecoderState*>(cinfo->master->apple_metal_decoder_);
-  if (state == nullptr || state->output == nil || state->texture == nil) {
+  if (state == nullptr || state->texture == nil ||
+      (!state->encoded_into_external_command && state->output == nil)) {
     return false;
   }
   OutputHandle* handle = new (std::nothrow) OutputHandle();
   if (handle == nullptr) return false;
   handle->buffer = state->output;
   handle->texture = state->texture;
+  if (state->encoded_into_external_command) {
+    handle->command = state->external_command;
+    handle->context = state->context;
+    handle->scratch = std::move(state->scratch);
+  }
   output->buffer = (__bridge void*)handle->buffer;
   output->texture = (__bridge void*)handle->texture;
-  output->buffer_contents = handle->buffer.contents;
+  output->buffer_contents = handle->buffer == nil ? nullptr : handle->buffer.contents;
   output->width = cinfo->output_width;
   output->height = cinfo->output_height;
-  output->row_bytes = state->output_row_bytes;
+  output->row_bytes = handle->buffer == nil ? 0 : state->output_row_bytes;
   output->pixel_format = JPEGLI_APPLE_METAL_PIXEL_FORMAT_RGBA8_UNORM;
   output->private_handle = handle;
   return true;
@@ -1020,10 +1481,16 @@ bool AppleMetalUploadCpuOutput(j_decompress_ptr cinfo, const uint8_t* pixels,
 
 void AppleMetalResetDecoder(j_decompress_ptr cinfo) {
   if (cinfo == nullptr || cinfo->master == nullptr) return;
-  DecoderState* state = static_cast<DecoderState*>(cinfo->master->apple_metal_decoder_);
+  jpeg_decomp_master* m = cinfo->master;
+  DecoderState* state = static_cast<DecoderState*>(m->apple_metal_decoder_);
   delete state;
-  cinfo->master->apple_metal_decoder_ = nullptr;
-  cinfo->master->apple_metal_active_ = false;
+  m->apple_metal_decoder_ = nullptr;
+  m->apple_metal_active_ = false;
+  m->apple_metal_bias_stats_enabled_ = false;
+  m->apple_metal_row_nonzeros_ = {};
+  m->apple_metal_row_sumabs_ = {};
+  m->apple_metal_command_buffer_ = nullptr;
+  m->apple_metal_destination_texture_ = nullptr;
 }
 
 }  // namespace jpegli

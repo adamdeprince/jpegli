@@ -197,4 +197,25 @@ uint64_t MemoryManagerPeakBytes(j_common_ptr cinfo) {
   return reinterpret_cast<MemoryManager*>(cinfo->mem)->peak_memory_usage;
 }
 
+jvirt_barray_ptr RequestExternalVirtualBlockArray(
+    j_common_ptr cinfo, boolean pre_zero, JDIMENSION blocksperrow,
+    JDIMENSION numrows, JDIMENSION maxaccess, JBLOCK* blocks) {
+  if (blocks == nullptr || blocksperrow == 0 || numrows == 0) {
+    JPEGLI_ERROR("Invalid external virtual coefficient array");
+  }
+  jvirt_barray_control* control =
+      Allocate<jvirt_barray_control>(cinfo, 1, JPOOL_IMAGE);
+  control->full_buffer = Allocate<JBLOCKROW>(cinfo, numrows, JPOOL_IMAGE);
+  control->numrows = numrows;
+  control->maxaccess = maxaccess;
+  for (size_t y = 0; y < numrows; ++y) {
+    control->full_buffer[y] = blocks + y * blocksperrow;
+  }
+  if (pre_zero) {
+    memset(blocks, 0,
+           static_cast<size_t>(blocksperrow) * numrows * sizeof(JBLOCK));
+  }
+  return control;
+}
+
 }  // namespace jpegli

@@ -145,6 +145,15 @@ if(MINGW)
       benchmark/jpegli_decode_benchmark.cc
       ssimulacra2.cc
     )
+    if(JPEGLI_ENABLE_APPLE_METAL)
+      target_sources(jpegli_decode_benchmark PRIVATE
+        benchmark/apple_metal_benchmark_helper.mm)
+      set_source_files_properties(
+        benchmark/apple_metal_benchmark_helper.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc -fno-rtti")
+      target_compile_definitions(jpegli_decode_benchmark PRIVATE
+        JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER=1)
+    endif()
     # jpegli is configured for the v6 libjpeg ABI by default. Ensure that its
     # generated jpeglib.h wins over Homebrew's v8 header from libturbojpeg.
     target_include_directories(jpegli_decode_benchmark BEFORE PRIVATE

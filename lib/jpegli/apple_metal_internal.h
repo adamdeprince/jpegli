@@ -18,6 +18,12 @@ namespace jpegli {
 // scans have completed.
 bool AppleMetalShouldAttempt(j_decompress_ptr cinfo, bool direct_output);
 
+// Lazily allocates the shared Metal coefficient backing before entropy decode.
+// On success AppleMetalCoefficientPlane returns the component bases that are
+// installed into the ordinary libjpeg virtual-array interface.
+bool AppleMetalPrepareCoefficientStorage(j_decompress_ptr cinfo);
+JBLOCK* AppleMetalCoefficientPlane(j_decompress_ptr cinfo, int component);
+
 // Reconstructs the decoded coefficient planes. PrepareForOutput must already
 // have been called and all scans must have been consumed.
 bool AppleMetalReconstruct(j_decompress_ptr cinfo, bool direct_output);

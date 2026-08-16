@@ -52,6 +52,9 @@
 #include "lib/extras/packed_image.h"
 #include "lib/extras/packed_image_convert.h"
 #include "lib/jpegli/apple_metal.h"
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+#include "tools/benchmark/apple_metal_benchmark_helper.h"
+#endif
 #include "lib/jpegli/decode.h"
 #include "lib/jpegli/decode_profile.h"
 #include "lib/jpegli/memory_manager.h"
@@ -228,9 +231,13 @@ enum class MetalDecodePath {
   kCpu,
   kMetalScanlines,
   kMetalDirect,
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+  kMetalCallerTexture,
+#endif
 };
 
 struct MetalDecodeSample {
+  double command_encoded_seconds = 0.0;
   double ready_seconds = 0.0;
   double total_seconds = 0.0;
   double process_cpu_seconds = 0.0;
@@ -247,6 +254,9 @@ struct MetalImageBenchmark {
   std::vector<MetalDecodeSample> cpu;
   std::vector<MetalDecodeSample> metal_scanlines;
   std::vector<MetalDecodeSample> metal_direct;
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+  std::vector<MetalDecodeSample> metal_caller_texture;
+#endif
 };
 
 struct JpegliErrorManager {
@@ -512,6 +522,10 @@ const char* MetalPathName(MetalDecodePath path) {
       return "metal_to_cpu";
     case MetalDecodePath::kMetalDirect:
       return "metal_direct";
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    case MetalDecodePath::kMetalCallerTexture:
+      return "metal_caller_texture";
+#endif
   }
   return "unknown";
 }
@@ -522,12 +536,18 @@ bool DecodeJpegliMetalPath(const ImageBenchmark& image, MetalDecodePath path,
   jpeg_decompress_struct cinfo = {};
   JpegliErrorManager jerr = {};
   JpegliAppleMetalOutput metal_output = {};
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+  JpegliAppleMetalBenchmarkTarget* caller_target = nullptr;
+#endif
   volatile bool created = false;
   volatile bool exported = false;
   cinfo.err = jpegli_std_error(&jerr.pub);
   jerr.pub.error_exit = JpegliErrorExit;
   if (setjmp(jerr.jump_buffer)) {
     if (exported) jpegli_apple_metal_release_output(&metal_output);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    JpegliAppleMetalBenchmarkTargetDestroy(caller_target);
+#endif
     if (created) jpegli_destroy_decompress(&cinfo);
     *error = std::string("jpegli: ") + jerr.message;
     return false;
@@ -551,18 +571,60 @@ bool DecodeJpegliMetalPath(const ImageBenchmark& image, MetalDecodePath path,
   }
   cinfo.out_color_space = JCS_EXT_RGBA;
 
-  if (path == MetalDecodePath::kMetalDirect) {
-    if (!jpegli_start_decompress_to_apple_metal(&cinfo, &metal_output)) {
+  const bool direct_path = path == MetalDecodePath::kMetalDirect;
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+  const bool caller_texture_path = path == MetalDecodePath::kMetalCallerTexture;
+  if (caller_texture_path) {
+    caller_target =
+        JpegliAppleMetalBenchmarkTargetCreate(image.width, image.height);
+    if (caller_target == nullptr) {
+      *error = "unable to allocate caller-owned Metal benchmark target";
+      jpegli_destroy_decompress(&cinfo);
+      return false;
+    }
+  }
+#else
+  constexpr bool caller_texture_path = false;
+#endif
+  if (direct_path || caller_texture_path) {
+    const bool started =
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+        caller_texture_path
+            ? jpegli_start_decompress_to_apple_metal_command_buffer(
+                  &cinfo, JpegliAppleMetalBenchmarkCommandBuffer(caller_target),
+                  JpegliAppleMetalBenchmarkTexture(caller_target),
+                  &metal_output)
+            :
+#endif
+            jpegli_start_decompress_to_apple_metal(&cinfo, &metal_output);
+    if (!started) {
       JpegliAppleMetalStats stats = {};
       jpegli_apple_metal_get_stats(&cinfo, &stats);
       *error = "direct Metal decode was unavailable";
       if (stats.fallback_reason[0] != '\0') {
         *error += std::string(": ") + stats.fallback_reason;
       }
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+      JpegliAppleMetalBenchmarkTargetDestroy(caller_target);
+#endif
       jpegli_destroy_decompress(&cinfo);
       return false;
     }
     exported = true;
+    sample->command_encoded_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    if (caller_texture_path &&
+        !JpegliAppleMetalBenchmarkCommitWaitAndRead(
+            caller_target, validation_output, image.width * kOutputChannels)) {
+      *error = "caller-owned Metal command buffer failed";
+      jpegli_apple_metal_release_output(&metal_output);
+      JpegliAppleMetalBenchmarkTargetDestroy(caller_target);
+      jpegli_destroy_decompress(&cinfo);
+      return false;
+    }
+#endif
     sample->ready_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
             .count();
@@ -576,24 +638,34 @@ bool DecodeJpegliMetalPath(const ImageBenchmark& image, MetalDecodePath path,
     }
     if (metal_output.width != image.width ||
         metal_output.height != image.height ||
-        metal_output.buffer_contents == nullptr ||
-        metal_output.row_bytes < image.width * kOutputChannels) {
+        (!caller_texture_path &&
+         (metal_output.buffer_contents == nullptr ||
+          metal_output.row_bytes < image.width * kOutputChannels))) {
       *error = "direct Metal output has invalid dimensions or layout";
       jpegli_apple_metal_release_output(&metal_output);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+      JpegliAppleMetalBenchmarkTargetDestroy(caller_target);
+#endif
       jpegli_destroy_decompress(&cinfo);
       return false;
     }
-    const uint8_t* source =
-        static_cast<const uint8_t*>(metal_output.buffer_contents);
-    if (validation_output != nullptr) {
-      for (size_t y = 0; y < image.height; ++y) {
-        memcpy(validation_output + y * image.width * kOutputChannels,
-               source + y * metal_output.row_bytes,
-               image.width * kOutputChannels);
+    if (!caller_texture_path) {
+      const uint8_t* source =
+          static_cast<const uint8_t*>(metal_output.buffer_contents);
+      if (validation_output != nullptr) {
+        for (size_t y = 0; y < image.height; ++y) {
+          memcpy(validation_output + y * image.width * kOutputChannels,
+                 source + y * metal_output.row_bytes,
+                 image.width * kOutputChannels);
+        }
       }
+      decode_sink ^= source[(image.height / 2) * metal_output.row_bytes +
+                            (image.width / 2) * kOutputChannels];
+    } else if (validation_output != nullptr) {
+      decode_sink ^= validation_output[image.output_size / 2];
+    } else {
+      decode_sink ^= image.jpeg[image.jpeg.size() / 2];
     }
-    decode_sink ^= source[(image.height / 2) * metal_output.row_bytes +
-                          (image.width / 2) * kOutputChannels];
   } else {
     if (!jpegli_start_decompress(&cinfo)) {
       *error = "jpegli: failed to start decompression";
@@ -639,6 +711,9 @@ bool DecodeJpegliMetalPath(const ImageBenchmark& image, MetalDecodePath path,
   if (!jpegli_finish_decompress(&cinfo)) {
     *error = "jpegli: failed to finish decompression";
     if (exported) jpegli_apple_metal_release_output(&metal_output);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    JpegliAppleMetalBenchmarkTargetDestroy(caller_target);
+#endif
     jpegli_destroy_decompress(&cinfo);
     return false;
   }
@@ -652,11 +727,17 @@ bool DecodeJpegliMetalPath(const ImageBenchmark& image, MetalDecodePath path,
       *error += std::string(": ") + sample->metal.fallback_reason;
     }
     if (exported) jpegli_apple_metal_release_output(&metal_output);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    JpegliAppleMetalBenchmarkTargetDestroy(caller_target);
+#endif
     jpegli_destroy_decompress(&cinfo);
     return false;
   }
   jpegli_destroy_decompress(&cinfo);
   if (exported) jpegli_apple_metal_release_output(&metal_output);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+  JpegliAppleMetalBenchmarkTargetDestroy(caller_target);
+#endif
   sample->total_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count();
@@ -1741,6 +1822,19 @@ std::vector<double> ReadySamples(const std::vector<MetalDecodeSample>& samples,
   return result;
 }
 
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+std::vector<double> CommandEncodedSamples(
+    const std::vector<MetalDecodeSample>& samples, bool cold) {
+  std::vector<double> result;
+  for (const MetalDecodeSample& sample : samples) {
+    if (sample.cold == cold) {
+      result.push_back(sample.command_encoded_seconds);
+    }
+  }
+  return result;
+}
+#endif
+
 std::vector<double> ProcessCpuSamples(
     const std::vector<MetalDecodeSample>& samples, bool cold) {
   std::vector<double> result;
@@ -1783,15 +1877,19 @@ bool WriteMetalCsv(const std::string& path,
     return false;
   }
   out << "image,width,height,pixels,jpeg_bytes,quality,chroma_subsampling,"
-         "progressive_level,path,cold,iteration,ready_ms,total_ms,"
+         "progressive_level,path,cold,iteration,command_encoded_ms,ready_ms,"
+         "total_ms,"
          "ready_process_cpu_ms,ready_process_energy_mj,"
          "ready_process_energy_available,megapixels_per_second,"
          "cpu_entropy_ms,metal_initialization_ms,coefficient_analysis_ms,"
          "coefficient_copy_ms,command_encoding_ms,submission_overhead_ms,"
-         "gpu_dequant_idct_ms,gpu_upsample_color_ms,cpu_output_copy_ms,"
+         "gpu_dequant_idct_ms,gpu_upsample_color_ms,gpu_fused_reconstruction_"
+         "ms,"
+         "cpu_output_copy_ms,"
          "reconstruction_total_ms,jpegli_peak_memory_bytes,cpu_decoder_bytes,"
-         "metal_buffer_bytes,decoder_retained_bytes,used_metal,"
-         "direct_output,fallback_reason\n";
+         "metal_buffer_bytes,decoder_retained_bytes,unified_coefficient_bytes,"
+         "float_plane_bytes,used_metal,direct_output,fused_pipeline,"
+         "caller_command_buffer,fallback_reason\n";
   out << std::fixed << std::setprecision(9);
   for (const MetalImageBenchmark& benchmark : benchmarks) {
     const auto write_path = [&](MetalDecodePath path_name,
@@ -1805,9 +1903,9 @@ bool WriteMetalCsv(const std::string& path,
             << benchmark.image.jpeg.size() << ',' << args.quality << ','
             << args.chroma_subsampling << ',' << args.progressive_level << ','
             << MetalPathName(path_name) << ',' << (sample.cold ? 1 : 0) << ','
-            << iteration << ',' << sample.ready_seconds * 1e3 << ','
-            << sample.total_seconds * 1e3 << ','
-            << sample.process_cpu_seconds * 1e3 << ','
+            << iteration << ',' << sample.command_encoded_seconds * 1e3 << ','
+            << sample.ready_seconds * 1e3 << ',' << sample.total_seconds * 1e3
+            << ',' << sample.process_cpu_seconds * 1e3 << ','
             << sample.process_energy_nj * 1e-6 << ','
             << (sample.process_energy_available ? 1 : 0) << ','
             << benchmark.image.width * benchmark.image.height * 1e-6 /
@@ -1823,19 +1921,28 @@ bool WriteMetalCsv(const std::string& path,
             << sample.metal.submission_overhead_ns * 1e-6 << ','
             << sample.metal.gpu_dequant_idct_ns * 1e-6 << ','
             << sample.metal.gpu_upsample_color_ns * 1e-6 << ','
+            << sample.metal.gpu_fused_reconstruction_ns * 1e-6 << ','
             << sample.metal.cpu_output_copy_ns * 1e-6 << ','
             << sample.metal.reconstruction_total_ns * 1e-6 << ','
             << sample.jpegli_memory_bytes << ','
             << sample.metal.cpu_decoder_bytes << ','
             << sample.metal.metal_buffer_bytes << ','
             << sample.metal.decoder_retained_bytes << ','
-            << sample.metal.used_metal << ',' << sample.metal.direct_output
-            << ',' << CsvEscape(sample.metal.fallback_reason) << '\n';
+            << sample.metal.unified_coefficient_bytes << ','
+            << sample.metal.float_plane_bytes << ',' << sample.metal.used_metal
+            << ',' << sample.metal.direct_output << ','
+            << sample.metal.fused_pipeline << ','
+            << sample.metal.caller_command_buffer << ','
+            << CsvEscape(sample.metal.fallback_reason) << '\n';
       }
     };
     write_path(MetalDecodePath::kCpu, benchmark.cpu);
     write_path(MetalDecodePath::kMetalScanlines, benchmark.metal_scanlines);
     write_path(MetalDecodePath::kMetalDirect, benchmark.metal_direct);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    write_path(MetalDecodePath::kMetalCallerTexture,
+               benchmark.metal_caller_texture);
+#endif
   }
   if (!out) {
     *error = "failed while writing CSV output " + path;
@@ -1864,6 +1971,9 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
   std::vector<uint8_t> cpu_output(max_output_size);
   std::vector<uint8_t> metal_output(max_output_size);
   std::vector<uint8_t> direct_output(max_output_size);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+  std::vector<uint8_t> caller_texture_output(max_output_size);
+#endif
   std::string error;
 
   fprintf(stderr,
@@ -1881,11 +1991,23 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
       }
       MetalDecodeSample sample;
       sample.cold = cold;
-      uint8_t* output =
-          path == MetalDecodePath::kMetalDirect
-              ? (cold ? direct_output.data() : nullptr)
-              : (path == MetalDecodePath::kCpu ? cpu_output.data()
-                                               : metal_output.data());
+      uint8_t* output = nullptr;
+      switch (path) {
+        case MetalDecodePath::kCpu:
+          output = cpu_output.data();
+          break;
+        case MetalDecodePath::kMetalScanlines:
+          output = metal_output.data();
+          break;
+        case MetalDecodePath::kMetalDirect:
+          output = cold ? direct_output.data() : nullptr;
+          break;
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+        case MetalDecodePath::kMetalCallerTexture:
+          output = cold ? caller_texture_output.data() : nullptr;
+          break;
+#endif
+      }
       if (!DecodeJpegliMetalPath(benchmark.image, path, output, &sample,
                                  &error)) {
         return false;
@@ -1896,14 +2018,24 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
     if (!run(MetalDecodePath::kCpu, true, &benchmark.cpu) ||
         !run(MetalDecodePath::kMetalScanlines, true,
              &benchmark.metal_scanlines) ||
-        !run(MetalDecodePath::kMetalDirect, true, &benchmark.metal_direct)) {
+        !run(MetalDecodePath::kMetalDirect, true, &benchmark.metal_direct)
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+        || !run(MetalDecodePath::kMetalCallerTexture, true,
+                &benchmark.metal_caller_texture)
+#endif
+    ) {
       fprintf(stderr, "%s: %s\n", benchmark.image.name.c_str(), error.c_str());
       return EXIT_FAILURE;
     }
     if (memcmp(cpu_output.data(), metal_output.data(),
                benchmark.image.output_size) != 0 ||
         memcmp(cpu_output.data(), direct_output.data(),
-               benchmark.image.output_size) != 0) {
+               benchmark.image.output_size) != 0
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+        || memcmp(cpu_output.data(), caller_texture_output.data(),
+                  benchmark.image.output_size) != 0
+#endif
+    ) {
       size_t differing = 0;
       int max_diff = 0;
       for (size_t i = 0; i < benchmark.image.output_size; ++i) {
@@ -1911,16 +2043,32 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
                                         static_cast<int>(metal_output[i]));
         const int direct_diff = std::abs(static_cast<int>(cpu_output[i]) -
                                          static_cast<int>(direct_output[i]));
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+        const int caller_diff =
+            std::abs(static_cast<int>(cpu_output[i]) -
+                     static_cast<int>(caller_texture_output[i]));
+        const int diff = std::max({metal_diff, direct_diff, caller_diff});
+#else
         const int diff = std::max(metal_diff, direct_diff);
+#endif
         if (diff != 0) ++differing;
         if (diff != 0 && differing <= 16) {
           fprintf(stderr,
                   "  byte %zu (x=%zu y=%zu c=%zu): CPU=%u Metal=%u "
-                  "Direct=%u\n",
+                  "Direct=%u"
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+                  " Caller=%u"
+#endif
+                  "\n",
                   i, (i / kOutputChannels) % benchmark.image.width,
                   (i / kOutputChannels) / benchmark.image.width,
                   i % kOutputChannels, cpu_output[i], metal_output[i],
-                  direct_output[i]);
+                  direct_output[i]
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+                  ,
+                  caller_texture_output[i]
+#endif
+          );
         }
         max_diff = std::max(max_diff, diff);
       }
@@ -1930,9 +2078,20 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
               benchmark.image.name.c_str(), differing, max_diff);
       return EXIT_FAILURE;
     }
-    const std::array<MetalDecodePath, 3> paths = {
-        MetalDecodePath::kCpu, MetalDecodePath::kMetalScanlines,
-        MetalDecodePath::kMetalDirect};
+    const std::array<MetalDecodePath,
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+                     4
+#else
+                     3
+#endif
+                     >
+        paths = {MetalDecodePath::kCpu, MetalDecodePath::kMetalScanlines,
+                 MetalDecodePath::kMetalDirect
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+                 ,
+                 MetalDecodePath::kMetalCallerTexture
+#endif
+        };
     const auto rotated_path = [&](size_t repetition, size_t position) {
       return paths[(repetition + position) % paths.size()];
     };
@@ -1940,11 +2099,11 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
       for (size_t position = 0; position < paths.size(); ++position) {
         const MetalDecodePath path = rotated_path(repetition, position);
         MetalDecodeSample warmup;
-        uint8_t* output = path == MetalDecodePath::kCpu
-                              ? cpu_output.data()
-                              : (path == MetalDecodePath::kMetalScanlines
-                                     ? metal_output.data()
-                                     : nullptr);
+        uint8_t* output = nullptr;
+        if (path == MetalDecodePath::kCpu) output = cpu_output.data();
+        if (path == MetalDecodePath::kMetalScanlines) {
+          output = metal_output.data();
+        }
         if (!DecodeJpegliMetalPath(benchmark.image, path, output, &warmup,
                                    &error)) {
           fprintf(stderr, "%s: %s\n", benchmark.image.name.c_str(),
@@ -1957,12 +2116,23 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
       for (size_t position = 0; position < paths.size(); ++position) {
         const MetalDecodePath path =
             rotated_path(args.warmups + repetition, position);
-        std::vector<MetalDecodeSample>* samples =
-            path == MetalDecodePath::kCpu
-                ? &benchmark.cpu
-                : (path == MetalDecodePath::kMetalScanlines
-                       ? &benchmark.metal_scanlines
-                       : &benchmark.metal_direct);
+        std::vector<MetalDecodeSample>* samples = nullptr;
+        switch (path) {
+          case MetalDecodePath::kCpu:
+            samples = &benchmark.cpu;
+            break;
+          case MetalDecodePath::kMetalScanlines:
+            samples = &benchmark.metal_scanlines;
+            break;
+          case MetalDecodePath::kMetalDirect:
+            samples = &benchmark.metal_direct;
+            break;
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+          case MetalDecodePath::kMetalCallerTexture:
+            samples = &benchmark.metal_caller_texture;
+            break;
+#endif
+        }
         if (!run(path, false, samples)) {
           fprintf(stderr, "%s: %s\n", benchmark.image.name.c_str(),
                   error.c_str());
@@ -1974,11 +2144,21 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
             benchmark.image.width, benchmark.image.height);
   }
 
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+  printf("\n%-17s %9s %10s %10s %10s %10s %10s %10s %10s %10s\n", "image", "MP",
+         "CPU p50", "CPU p95", "Mtl p50", "Mtl p95", "Dir p50", "Dir p95",
+         "Call p50", "Call p95");
+  printf("%-17s %9s %10s %10s %10s %10s %10s %10s %10s %10s\n",
+         "-----------------", "---------", "----------", "----------",
+         "----------", "----------", "----------", "----------", "----------",
+         "----------");
+#else
   printf("\n%-17s %9s %10s %10s %10s %10s %10s %10s\n", "image", "MP",
          "CPU p50", "CPU p95", "Mtl p50", "Mtl p95", "Dir p50", "Dir p95");
   printf("%-17s %9s %10s %10s %10s %10s %10s %10s\n", "-----------------",
          "---------", "----------", "----------", "----------", "----------",
          "----------", "----------");
+#endif
   size_t crossover_pixels = std::numeric_limits<size_t>::max();
   for (const MetalImageBenchmark& benchmark : benchmarks) {
     const std::vector<double> cpu = ReadySamples(benchmark.cpu, false);
@@ -1986,18 +2166,30 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
         ReadySamples(benchmark.metal_scanlines, false);
     const std::vector<double> direct =
         ReadySamples(benchmark.metal_direct, false);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    const std::vector<double> caller =
+        ReadySamples(benchmark.metal_caller_texture, false);
+#endif
     const std::vector<double> cpu_process =
         ProcessCpuSamples(benchmark.cpu, false);
     const std::vector<double> metal_process =
         ProcessCpuSamples(benchmark.metal_scanlines, false);
     const std::vector<double> direct_process =
         ProcessCpuSamples(benchmark.metal_direct, false);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    const std::vector<double> caller_process =
+        ProcessCpuSamples(benchmark.metal_caller_texture, false);
+#endif
     const std::vector<double> cpu_energy =
         ProcessEnergySamples(benchmark.cpu, false);
     const std::vector<double> metal_energy =
         ProcessEnergySamples(benchmark.metal_scanlines, false);
     const std::vector<double> direct_energy =
         ProcessEnergySamples(benchmark.metal_direct, false);
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    const std::vector<double> caller_energy =
+        ProcessEnergySamples(benchmark.metal_caller_texture, false);
+#endif
     const double cpu_p50 = Percentile(cpu, 0.50);
     const double metal_p50 = Percentile(metal, 0.50);
     const size_t pixels = benchmark.image.width * benchmark.image.height;
@@ -2006,10 +2198,19 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
     if (metal_p50 < cpu_p50 && metal_p95 < cpu_p95) {
       crossover_pixels = std::min(crossover_pixels, pixels);
     }
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    printf(
+        "%-17s %9.3f %10.3f %10.3f %10.3f %10.3f %10.3f %10.3f %10.3f %10.3f\n",
+        ShortName(benchmark.image.name).c_str(), pixels / 1e6, cpu_p50 * 1e3,
+        cpu_p95 * 1e3, metal_p50 * 1e3, metal_p95 * 1e3,
+        Percentile(direct, 0.50) * 1e3, Percentile(direct, 0.95) * 1e3,
+        Percentile(caller, 0.50) * 1e3, Percentile(caller, 0.95) * 1e3);
+#else
     printf("%-17s %9.3f %10.3f %10.3f %10.3f %10.3f %10.3f %10.3f\n",
            ShortName(benchmark.image.name).c_str(), pixels / 1e6, cpu_p50 * 1e3,
            cpu_p95 * 1e3, metal_p50 * 1e3, metal_p95 * 1e3,
            Percentile(direct, 0.50) * 1e3, Percentile(direct, 0.95) * 1e3);
+#endif
 
     const MetalDecodeSample& stage =
         RepresentativeMetalSample(benchmark.metal_scanlines);
@@ -2017,19 +2218,26 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
     const MetalDecodeSample& cpu_stage =
         RepresentativeMetalSample(benchmark.cpu);
     std::string energy_summary = "unavailable";
-    if (!cpu_energy.empty() && !metal_energy.empty() &&
-        !direct_energy.empty()) {
+    if (!cpu_energy.empty() && !metal_energy.empty() && !direct_energy.empty()
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+        && !caller_energy.empty()
+#endif
+    ) {
       std::ostringstream stream;
       stream << std::fixed << std::setprecision(3)
              << Percentile(cpu_energy, 0.50) << '/'
              << Percentile(metal_energy, 0.50) << '/'
-             << Percentile(direct_energy, 0.50) << " mJ";
+             << Percentile(direct_energy, 0.50)
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+             << '/' << Percentile(caller_energy, 0.50)
+#endif
+             << " mJ";
       energy_summary = stream.str();
     }
     printf(
         "  cold CPU/Metal/direct: %.3f / %.3f / %.3f ms; entropy %.3f ms; "
         "cold init %.3f ms; analysis %.3f ms; coeff copy %.3f ms; "
-        "GPU IDCT %.3f ms; GPU upsample/color %.3f ms; readback copy "
+        "GPU IDCT %.3f ms; GPU fused/upsample-color %.3f ms; readback copy "
         "%.3f ms; ready process CPU %.3f/%.3f/%.3f ms; process energy "
         "%s; %.1f/%.1f/%.1f "
         "MP/s "
@@ -2045,7 +2253,7 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
         stage.metal.coefficient_analysis_ns * 1e-6,
         stage.metal.coefficient_copy_ns * 1e-6,
         stage.metal.gpu_dequant_idct_ns * 1e-6,
-        stage.metal.gpu_upsample_color_ns * 1e-6,
+        stage.metal.gpu_fused_reconstruction_ns * 1e-6,
         stage.metal.cpu_output_copy_ns * 1e-6,
         Percentile(cpu_process, 0.50) * 1e3,
         Percentile(metal_process, 0.50) * 1e3,
@@ -2057,6 +2265,23 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
         stage.metal.cpu_decoder_bytes / (1024.0 * 1024.0),
         stage.metal.metal_buffer_bytes / (1024.0 * 1024.0),
         stage.metal.decoder_retained_bytes / (1024.0 * 1024.0));
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+    const MetalDecodeSample& caller_stage =
+        RepresentativeMetalSample(benchmark.metal_caller_texture);
+    printf(
+        "  caller texture cold encoded/ready %.3f/%.3f ms; warm encoded/ready "
+        "p50 %.3f/%.3f ms; process CPU %.3f ms; %.1f MP/s; unified coeff/float "
+        "planes %.2f/%.2f MiB\n",
+        CommandEncodedSamples(benchmark.metal_caller_texture, true)[0] * 1e3,
+        ReadySamples(benchmark.metal_caller_texture, true)[0] * 1e3,
+        Percentile(CommandEncodedSamples(benchmark.metal_caller_texture, false),
+                   0.50) *
+            1e3,
+        Percentile(caller, 0.50) * 1e3, Percentile(caller_process, 0.50) * 1e3,
+        pixels * 1e-6 / Percentile(caller, 0.50),
+        caller_stage.metal.unified_coefficient_bytes / (1024.0 * 1024.0),
+        caller_stage.metal.float_plane_bytes / (1024.0 * 1024.0));
+#endif
   }
   if (crossover_pixels == std::numeric_limits<size_t>::max()) {
     printf("\nNo CPU/Metal crossover was observed in this corpus.\n");
@@ -2066,9 +2291,16 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
         "(%.3f MP).\n",
         crossover_pixels, crossover_pixels / 1e6);
   }
+#if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
+  printf(
+      "All Metal scanline, direct-output, and caller-texture bytes matched CPU "
+      "jpegli "
+      "exactly.\n");
+#else
   printf(
       "All Metal scanline and direct-output bytes matched CPU jpegli "
       "exactly.\n");
+#endif
   if (!args.csv.empty() && !WriteMetalCsv(args.csv, benchmarks, args, &error)) {
     fprintf(stderr, "%s\n", error.c_str());
     return EXIT_FAILURE;

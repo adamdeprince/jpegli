@@ -26,6 +26,24 @@ namespace {
 // Max 2 bytes per 8 bits (worst case is all bytes are escaped 0xff)
 constexpr int kMaxMCUByteSize = 6048;
 
+inline int CoefficientAbs(coeff_t value) {
+  return value < 0 ? -static_cast<int>(value) : static_cast<int>(value);
+}
+
+template <bool kCollectStats>
+inline void StoreCoefficient(coeff_t* coefficients, int k, coeff_t value,
+                             int* nonzeros, int* sumabs) {
+  if (!kCollectStats) {
+    coefficients[k] = value;
+    return;
+  }
+  const coeff_t old = coefficients[k];
+  coefficients[k] = value;
+  if (old == value) return;
+  nonzeros[k] += (value != 0) - (old != 0);
+  sumabs[k] += CoefficientAbs(value) - CoefficientAbs(old);
+}
+
 // Helper structure to read bits from the entropy coded data segment.
 struct BitReaderState {
   BitReaderState(const uint8_t* data, const size_t len, size_t pos)
@@ -174,10 +192,11 @@ int HuffExtend(int x, int s) {
 }
 
 // Decodes one 8x8 block of DCT coefficients from the bit stream.
+template <bool kCollectStats>
 bool DecodeDCTBlock(const HuffmanTableEntry* dc_huff,
                     const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
                     int* eobrun, BitReaderState* br, coeff_t* last_dc_coeff,
-                    coeff_t* coeffs) {
+                    coeff_t* coeffs, int* nonzeros, int* sumabs) {
   // Nowadays multiplication is even faster than variable shift.
   int Am = 1 << Al;
   bool eobrun_allowed = Ss > 0;
@@ -193,7 +212,8 @@ bool DecodeDCTBlock(const HuffmanTableEntry* dc_huff,
     }
     int coeff = diff + *last_dc_coeff;
     const int dc_coeff = coeff * Am;
-    coeffs[0] = dc_coeff;
+    StoreCoefficient<kCollectStats>(coeffs, 0, static_cast<coeff_t>(dc_coeff),
+                                    nonzeros, sumabs);
     // TODO(eustas): is there a more elegant / explicit way to check this?
     if (dc_coeff != coeffs[0]) {
       return false;
@@ -225,7 +245,9 @@ bool DecodeDCTBlock(const HuffmanTableEntry* dc_huff,
       }
       int bits = br->ReadBits(s);
       int coeff = HuffExtend(bits, s);
-      coeffs[kJPEGNaturalOrder[k]] = coeff * Am;
+      const int natural = kJPEGNaturalOrder[k];
+      StoreCoefficient<kCollectStats>(
+          coeffs, natural, static_cast<coeff_t>(coeff * Am), nonzeros, sumabs);
     } else if (r == 15) {
       k += 15;
     } else {
@@ -243,16 +265,20 @@ bool DecodeDCTBlock(const HuffmanTableEntry* dc_huff,
   return true;
 }
 
+template <bool kCollectStats>
 bool RefineDCTBlock(const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
-                    int* eobrun, BitReaderState* br, coeff_t* coeffs) {
+                    int* eobrun, BitReaderState* br, coeff_t* coeffs,
+                    int* nonzeros, int* sumabs) {
   // Nowadays multiplication is even faster than variable shift.
   int Am = 1 << Al;
   bool eobrun_allowed = Ss > 0;
   if (Ss == 0) {
     int s = br->ReadBits(1);
     coeff_t dc_coeff = coeffs[0];
-    dc_coeff |= s * Am;
-    coeffs[0] = dc_coeff;
+    if (s != 0) {
+      dc_coeff |= Am;
+      StoreCoefficient<kCollectStats>(coeffs, 0, dc_coeff, nonzeros, sumabs);
+    }
     ++Ss;
   }
   if (Ss > Se) {
@@ -294,16 +320,16 @@ bool RefineDCTBlock(const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
       do {
         coeff_t thiscoef = coeffs[kJPEGNaturalOrder[k]];
         if (thiscoef != 0) {
-          if (br->ReadBits(1)) {
-            if ((thiscoef & p1) == 0) {
-              if (thiscoef >= 0) {
-                thiscoef += p1;
-              } else {
-                thiscoef += m1;
-              }
+          if (br->ReadBits(1) && (thiscoef & p1) == 0) {
+            const int natural = kJPEGNaturalOrder[k];
+            if (thiscoef >= 0) {
+              thiscoef += p1;
+            } else {
+              thiscoef += m1;
             }
+            coeffs[natural] = thiscoef;
+            if (kCollectStats) sumabs[natural] += p1;
           }
-          coeffs[kJPEGNaturalOrder[k]] = thiscoef;
         } else {
           if (--r < 0) {
             break;
@@ -315,7 +341,9 @@ bool RefineDCTBlock(const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
         if (k > Se) {
           return false;
         }
-        coeffs[kJPEGNaturalOrder[k]] = s;
+        StoreCoefficient<kCollectStats>(coeffs, kJPEGNaturalOrder[k],
+                                        static_cast<coeff_t>(s), nonzeros,
+                                        sumabs);
       }
     }
   }
@@ -326,16 +354,16 @@ bool RefineDCTBlock(const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
     for (; k <= Se; k++) {
       coeff_t thiscoef = coeffs[kJPEGNaturalOrder[k]];
       if (thiscoef != 0) {
-        if (br->ReadBits(1)) {
-          if ((thiscoef & p1) == 0) {
-            if (thiscoef >= 0) {
-              thiscoef += p1;
-            } else {
-              thiscoef += m1;
-            }
+        if (br->ReadBits(1) && (thiscoef & p1) == 0) {
+          const int natural = kJPEGNaturalOrder[k];
+          if (thiscoef >= 0) {
+            thiscoef += p1;
+          } else {
+            thiscoef += m1;
           }
+          coeffs[natural] = thiscoef;
+          if (kCollectStats) sumabs[natural] += p1;
         }
-        coeffs[kJPEGNaturalOrder[k]] = thiscoef;
       }
     }
   }
@@ -387,6 +415,24 @@ void RestoreMCUCodingState(j_decompress_ptr cinfo) {
           std::min<size_t>(comp->MCU_width, comp->width_in_blocks - block_x);
       size_t ncoeffs = nblocks * DCTSIZE2;
       coeff_t* coeffs = &m->coeff_rows[c][biy][block_x][0];
+      if (m->apple_metal_bias_stats_enabled_ &&
+          comp->h_samp_factor == cinfo->max_h_samp_factor &&
+          comp->v_samp_factor == cinfo->max_v_samp_factor) {
+        const size_t imcu = block_y / comp->v_samp_factor;
+        const size_t base =
+            (static_cast<size_t>(c) * cinfo->total_iMCU_rows + imcu) * DCTSIZE2;
+        int* nonzeros = m->apple_metal_row_nonzeros_.data() + base;
+        int* sumabs = m->apple_metal_row_sumabs_.data() + base;
+        for (size_t k = 0; k < ncoeffs; ++k) {
+          const coeff_t restored = m->mcu_.coeffs[offset + k];
+          const coeff_t current = coeffs[k];
+          if (restored == current) continue;
+          const size_t frequency = k & (DCTSIZE2 - 1);
+          nonzeros[frequency] += (restored != 0) - (current != 0);
+          sumabs[frequency] +=
+              CoefficientAbs(restored) - CoefficientAbs(current);
+        }
+      }
       memcpy(coeffs, &m->mcu_.coeffs[offset], ncoeffs * sizeof(coeffs[0]));
       offset += ncoeffs;
     }
@@ -501,19 +547,41 @@ int ProcessScan(j_decompress_ptr cinfo, const uint8_t* const data,
           } else {
             coeffs = &m->coeff_rows[c][biy][block_x][0];
           }
-          if (cinfo->Ah == 0) {
-            if (!DecodeDCTBlock(dc_lut, ac_lut, cinfo->Ss, cinfo->Se, cinfo->Al,
-                                &m->eobrun_, &br,
-                                &m->last_dc_coeff_[comp->component_index],
-                                coeffs)) {
-              scan_ok = false;
-            }
-          } else {
-            if (!RefineDCTBlock(ac_lut, cinfo->Ss, cinfo->Se, cinfo->Al,
-                                &m->eobrun_, &br, coeffs)) {
-              scan_ok = false;
-            }
+          int* nonzeros = nullptr;
+          int* sumabs = nullptr;
+          if (coeffs != sink_block && m->apple_metal_bias_stats_enabled_ &&
+              comp->h_samp_factor == cinfo->max_h_samp_factor &&
+              comp->v_samp_factor == cinfo->max_v_samp_factor) {
+            const size_t imcu = block_y / comp->v_samp_factor;
+            const size_t base =
+                (static_cast<size_t>(c) * cinfo->total_iMCU_rows + imcu) *
+                DCTSIZE2;
+            nonzeros = m->apple_metal_row_nonzeros_.data() + base;
+            sumabs = m->apple_metal_row_sumabs_.data() + base;
           }
+          bool block_ok = false;
+          if (cinfo->Ah == 0) {
+            block_ok = nonzeros == nullptr
+                           ? DecodeDCTBlock<false>(
+                                 dc_lut, ac_lut, cinfo->Ss, cinfo->Se,
+                                 cinfo->Al, &m->eobrun_, &br,
+                                 &m->last_dc_coeff_[comp->component_index],
+                                 coeffs, nullptr, nullptr)
+                           : DecodeDCTBlock<true>(
+                                 dc_lut, ac_lut, cinfo->Ss, cinfo->Se,
+                                 cinfo->Al, &m->eobrun_, &br,
+                                 &m->last_dc_coeff_[comp->component_index],
+                                 coeffs, nonzeros, sumabs);
+          } else {
+            block_ok = nonzeros == nullptr
+                           ? RefineDCTBlock<false>(ac_lut, cinfo->Ss, cinfo->Se,
+                                                   cinfo->Al, &m->eobrun_, &br,
+                                                   coeffs, nullptr, nullptr)
+                           : RefineDCTBlock<true>(ac_lut, cinfo->Ss, cinfo->Se,
+                                                  cinfo->Al, &m->eobrun_, &br,
+                                                  coeffs, nonzeros, sumabs);
+          }
+          if (!block_ok) scan_ok = false;
         }
       }
     }

@@ -8,9 +8,20 @@ RGBA8 output after the required scans are complete.
 
 This backend targets low latency for one consumer image. It does not create
 workers, pipeline images, maintain multiple command streams, or schedule
-concurrent decoder jobs. The reconstruction kernels use one command buffer and
-two compute encoders so IDCT work is not redundantly repeated for every output
-pixel. This measured faster than separate submissions on Apple M4.
+concurrent decoder jobs. Entropy decoding writes coefficient blocks directly
+into an `MTLStorageModeShared` buffer, so reconstruction does not copy a second
+coefficient image. Per-iMCU adaptive-dequantization statistics are updated as
+coefficients change, including progressive refinement and input rollback, so
+there is no final coefficient-analysis sweep either.
+
+The retained pipelines are specialized by sampling mode. Grayscale, 4:4:4,
+and box-filtered 4:2:2/4:2:0 run dequantization, 8x8 IDCT, sampling, color
+conversion, and texture output in one tiled kernel. Fancy 4:2:2/4:2:0 retains
+only the two smaller chroma planes, then fuses luma IDCT, chroma sampling,
+color conversion, and output. Other eligible ratios use the exact legacy
+layout. IDCT rows and columns are cooperatively evaluated by SIMD-group lanes
+with threadgroup transposition rather than by one serial GPU thread per block.
+All work for one image is encoded into one command buffer.
 
 ## Building
 
@@ -37,7 +48,7 @@ for validating that fallback.
 ## Runtime selection
 
 The standard scanline API defaults to `JPEGLI_APPLE_METAL_AUTO`. AUTO uses the
-CPU below 786,432 output pixels, the conservative measured M4 p50/p95
+CPU below 480,000 output pixels, the conservative measured M4 p50/p95
 crossover across baseline and progressive inputs, and uses Metal for eligible
 larger images. Applications can select
 `JPEGLI_APPLE_METAL_DISABLED` or `JPEGLI_APPLE_METAL_FORCE` after creating the
@@ -55,9 +66,9 @@ CPU; buffered progressive output therefore preserves existing incremental
 behavior.
 
 JPEGli's entropy decoder stores each coefficient block in natural 8x8 order,
-so this backend does not need a separate inverse-zigzag pass. Dequantization is
-fused into the IDCT kernel, while upsampling and color conversion share the
-second kernel.
+so this backend does not need a separate inverse-zigzag pass. Inputs that do
+require reordering must do it on the GPU reconstruction side rather than
+changing entropy/scan-state behavior.
 
 ## Direct texture output
 
@@ -110,6 +121,47 @@ The caller must release every successful output. It is safe to finish, abort,
 or destroy the decompressor first because the output retains its own Metal
 objects.
 
+### Caller-owned command buffer and texture
+
+An application that already has a display command buffer can avoid JPEGli's
+queue submission, wait, output allocation, and CPU readback. JPEGli encodes
+reconstruction into an exact-size writable RGBA8Unorm texture and returns
+without committing the command buffer:
+
+```objc
+id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+id<MTLCommandQueue> queue = [device newCommandQueue];
+id<MTLCommandBuffer> command = [queue commandBuffer];
+
+MTLTextureDescriptor* descriptor =
+    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+        MTLPixelFormatRGBA8Unorm
+                                                       width:cinfo.output_width
+                                                      height:cinfo.output_height
+                                                   mipmapped:NO];
+descriptor.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+
+JpegliAppleMetalOutput output = {};
+if (jpegli_start_decompress_to_apple_metal_command_buffer(
+        &cinfo, (__bridge void*)command, (__bridge void*)texture, &output)) {
+  // Encode display/Core Image work that consumes texture into this command.
+  [command commit];
+  jpegli_finish_decompress(&cinfo);
+  jpegli_destroy_decompress(&cinfo);
+  [command waitUntilCompleted];
+  jpegli_apple_metal_release_output(&output);
+}
+```
+
+The command buffer and texture must use JPEGli's system Metal device. The
+output handle retains the coefficient, bias, dequantization, and optional
+chroma resources referenced by the encoded work; it has no buffer or CPU
+address. Release it only after the command is completed or discarded. A
+caller-owned command-buffer request never silently substitutes a separate
+destination on an unsupported case: it returns false and leaves the ordinary
+CPU decoder usable.
+
 ## Resource and application lifecycle
 
 Device, command queue, shader library, and pipelines are initialized lazily.
@@ -149,16 +201,22 @@ build-metal/tools/jpegli_decode_benchmark IMAGE_OR_DIRECTORY \
 The measured M4 results and methodology are recorded in
 [apple_metal_results.md](apple_metal_results.md).
 
-The CSV includes cold/warm ready and total latency, process CPU time and the
-macOS per-process energy counter to ready, MP/s, CPU entropy time, Metal
-initialization, coefficient analysis/copy, command encoding/submission, GPU
-IDCT, GPU upsampling/color conversion, requested CPU output copy, and CPU,
-Metal-buffer, and combined retained memory. Direct texture readiness excludes
-benchmark-only validation readback. Energy is reported as unavailable when the
+The CSV includes cold/warm command-encoded, ready, and total latency; process
+CPU time and the macOS per-process energy counter to ready; MP/s; CPU entropy;
+Metal initialization; coefficient analysis/copy; command
+encoding/submission; separate GPU IDCT, upsampling/color, and fused-kernel
+time; requested CPU output copy; unified coefficient and float-plane bytes;
+and CPU, Metal-buffer, and combined retained memory. Direct texture readiness
+excludes benchmark-only validation readback. The caller-command path reports
+both the point at which JPEGli has finished encoding and the later point at
+which the benchmark's commit/wait completes. Its conservative end-to-end
+caller interval also includes constructing and releasing the helper's external
+queue, command buffer, and texture. Energy is reported as unavailable when the
 host kernel does not expose the current `RUSAGE_INFO_V6` counter. It is a
-whole-process counter sampled around each serial decode. Its update granularity
-is too coarse for some short decodes (including occasional zero deltas), so it
-is raw diagnostic telemetry rather than a component-level power measurement.
+whole-process counter sampled around each serial decode. Its update
+granularity is too coarse for some short decodes (including occasional zero
+deltas), so it is raw diagnostic telemetry rather than a component-level power
+measurement.
 
 M4 is the validated target. M5 has not yet been measured for crossover or
 bit-exact shader behavior. A build made without the full Xcode Metal toolchain
