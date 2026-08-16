@@ -37,9 +37,10 @@ if [[ "$power_source" != *"AC Power"* ]]; then
   echo "energy campaign requires AC power; current state: $power_source" >&2
   exit 1
 fi
-power_profile=$(system_profiler SPPowerDataType)
-if [[ "$power_profile" != *"High Power Mode: Yes"* ]]; then
-  echo "energy campaign requires High Power Mode" >&2
+live_mode=$(pmset -g live | awk '$1 == "powermode" { print $2 }')
+if [[ "$live_mode" != "2" ]]; then
+  echo "energy campaign requires High Power Mode (live powermode 2); " \
+       "current mode: ${live_mode:-unknown}" >&2
   exit 1
 fi
 
@@ -50,6 +51,7 @@ sysctl hw.model hw.ncpu hw.perflevel0.physicalcpu \
   hw.perflevel1.physicalcpu > "$output/hardware.txt"
 system_profiler SPDisplaysDataType > "$output/display-metal.txt"
 pmset -g batt > "$output/power-before.txt"
+pmset -g live >> "$output/power-before.txt"
 pmset -g therm >> "$output/power-before.txt"
 pmset -g custom >> "$output/power-before.txt"
 git -C "$repository" rev-parse HEAD > "$output/commit.txt"
@@ -97,6 +99,7 @@ run_case 90 420 2 q90-420-progressive
 run_case 90 444 2 q90-444-progressive
 
 pmset -g batt > "$output/power-after.txt"
+pmset -g live >> "$output/power-after.txt"
 pmset -g therm >> "$output/power-after.txt"
 pmset -g custom >> "$output/power-after.txt"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$output/end-utc.txt"
