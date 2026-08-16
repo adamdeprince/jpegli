@@ -7,17 +7,16 @@
 #ifndef JPEGLI_LIB_JPEGLI_DECODE_STAGE_PROFILE_H_
 #define JPEGLI_LIB_JPEGLI_DECODE_STAGE_PROFILE_H_
 
+#include <jpeglib.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-
-#include <jpeglib.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define JPEGLI_DECODE_STAGE_PROFILE_ABI_VERSION 1u
+#define JPEGLI_DECODE_STAGE_PROFILE_ABI_VERSION 2u
 
 // Stages follow the decoder's implementation boundaries. Entropy decoding is
 // fused with run-length expansion, inverse coefficient ordering, DC prediction,
@@ -28,6 +27,10 @@ typedef enum jpegli_decode_stage_profile_stage {
   JPEGLI_DECODE_STAGE_MARKER_PARSING,
   JPEGLI_DECODE_STAGE_SCAN_PREPARATION,
   JPEGLI_DECODE_STAGE_ENTROPY_AND_COEFFICIENT_RECONSTRUCTION,
+  JPEGLI_DECODE_STAGE_PROGRESSIVE_COEFFICIENT_EVENT_UPLOAD,
+  JPEGLI_DECODE_STAGE_PROGRESSIVE_COEFFICIENT_GPU_RECONSTRUCTION,
+  JPEGLI_DECODE_STAGE_PROGRESSIVE_COEFFICIENT_READBACK,
+  JPEGLI_DECODE_STAGE_PROGRESSIVE_COEFFICIENT_CPU_FALLBACK,
   JPEGLI_DECODE_STAGE_OUTPUT_PREPARATION,
   JPEGLI_DECODE_STAGE_DEQUANT_BIAS_SMOOTHING_AND_IDCT,
   JPEGLI_DECODE_STAGE_CHROMA_UPSAMPLING,
@@ -47,14 +50,17 @@ typedef struct jpegli_decode_stage_profile {
   uint64_t timer_overhead_ticks;
   double timer_ticks_per_second;
   uint64_t decoder_elapsed_ns;
+  uint64_t progressive_coefficient_events;
+  uint64_t progressive_coefficient_count;
+  uint64_t progressive_coefficient_gpu_device_ns;
   jpegli_decode_stage_profile_entry stages[JPEGLI_DECODE_STAGE_COUNT];
 } jpegli_decode_stage_profile;
 
 // Enables profiling for one decompressor. The caller-owned profile must remain
 // alive through jpeg_finish_decompress(). Returns nonzero when profiling is
 // compiled in and the arguments and platform timer are valid.
-int jpegli_enable_decode_stage_profiling(
-    j_decompress_ptr cinfo, jpegli_decode_stage_profile* profile);
+int jpegli_enable_decode_stage_profiling(j_decompress_ptr cinfo,
+                                         jpegli_decode_stage_profile* profile);
 
 #ifdef __cplusplus
 }  // extern "C"

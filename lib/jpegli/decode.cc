@@ -16,6 +16,7 @@
 #include "lib/base/byte_order.h"
 #include "lib/base/status.h"
 #include "lib/base/types.h"
+#include "lib/jpegli/amd_vulkan_decode_coefficients.h"
 #include "lib/jpegli/color_quantize.h"
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/common_internal.h"
@@ -60,6 +61,16 @@ void InitializeImage(j_decompress_ptr cinfo) {
   m->input_buffer_.clear();
   m->input_buffer_pos_ = 0;
   m->codestream_bits_ahead_ = 0;
+  m->amd_decode_coefficients_active_ = false;
+  m->amd_decode_coefficients_gpu_ = false;
+  m->amd_decode_coefficients_reconstructed_ = false;
+  m->amd_decode_total_blocks_ = 0;
+  m->amd_decode_total_coefficients_ = 0;
+  memset(m->amd_decode_component_block_offsets_, 0,
+         sizeof(m->amd_decode_component_block_offsets_));
+  m->amd_decode_significant_.clear();
+  m->amd_decode_negative_.clear();
+  m->amd_decode_coefficient_events_.clear();
   m->is_multiscan_ = false;
   m->found_soi_ = false;
   m->found_dri_ = false;
@@ -213,8 +224,8 @@ void BuildHuffmanLookupTable(j_decompress_ptr cinfo, JHUFF_TBL* table,
 
 void PrepareForScan(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
-  DecodeStageProfileTimer profile_timer(
-      m->decode_stage_profile, JPEGLI_DECODE_STAGE_SCAN_PREPARATION);
+  DecodeStageProfileTimer profile_timer(m->decode_stage_profile,
+                                        JPEGLI_DECODE_STAGE_SCAN_PREPARATION);
   for (int i = 0; i < cinfo->comps_in_scan; ++i) {
     int comp_idx = cinfo->cur_comp_info[i]->component_index;
     int* prev_coef_bits = cinfo->coef_bits[comp_idx + cinfo->num_components];
@@ -325,11 +336,10 @@ int ConsumeInput(j_decompress_ptr cinfo) {
       DecodeStageProfileTimer profile_timer(
           m->decode_stage_profile,
           JPEGLI_DECODE_STAGE_ENTROPY_AND_COEFFICIENT_RECONSTRUCTION);
-      status =
-          ProcessScan(cinfo, data, len, &pos, &m->codestream_bits_ahead_);
+      status = ProcessScan(cinfo, data, len, &pos, &m->codestream_bits_ahead_);
     } else {
-      DecodeStageProfileTimer profile_timer(
-          m->decode_stage_profile, JPEGLI_DECODE_STAGE_MARKER_PARSING);
+      DecodeStageProfileTimer profile_timer(m->decode_stage_profile,
+                                            JPEGLI_DECODE_STAGE_MARKER_PARSING);
       status = ProcessMarkers(cinfo, data, len, &pos);
     }
     if (m->input_buffer_.empty()) {
@@ -497,8 +507,8 @@ boolean PrepareQuantizedOutput(j_decompress_ptr cinfo) {
 
 void AllocateCoefficientBuffer(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
-  DecodeStageProfileTimer profile_timer(
-      m->decode_stage_profile, JPEGLI_DECODE_STAGE_BUFFER_ALLOCATION);
+  DecodeStageProfileTimer profile_timer(m->decode_stage_profile,
+                                        JPEGLI_DECODE_STAGE_BUFFER_ALLOCATION);
   j_common_ptr comptr = reinterpret_cast<j_common_ptr>(cinfo);
   jvirt_barray_ptr* coef_arrays = jpegli::Allocate<jvirt_barray_ptr>(
       cinfo, cinfo->num_components, JPOOL_IMAGE);
@@ -512,12 +522,13 @@ void AllocateCoefficientBuffer(j_decompress_ptr cinfo) {
   }
   cinfo->master->coef_arrays = coef_arrays;
   (*cinfo->mem->realize_virt_arrays)(comptr);
+  AmdVulkanDecodeCoefficientsPrepare(cinfo);
 }
 
 void AllocateOutputBuffers(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
-  DecodeStageProfileTimer profile_timer(
-      m->decode_stage_profile, JPEGLI_DECODE_STAGE_BUFFER_ALLOCATION);
+  DecodeStageProfileTimer profile_timer(m->decode_stage_profile,
+                                        JPEGLI_DECODE_STAGE_BUFFER_ALLOCATION);
   size_t iMCU_width =
       static_cast<size_t>(cinfo->max_h_samp_factor) * m->min_scaled_dct_size;
   size_t output_stride = m->iMCU_cols_ * iMCU_width;
@@ -851,6 +862,9 @@ boolean jpegli_start_decompress(j_decompress_ptr cinfo) {
       }
     }
   }
+  if (!jpegli::AmdVulkanDecodeCoefficientsFinish(cinfo)) {
+    JPEGLI_ERROR("Failed to reconstruct progressive coefficients");
+  }
   cinfo->output_scan_number = cinfo->input_scan_number;
   jpegli::PrepareForOutput(cinfo);
   if (cinfo->quantize_colors) {
@@ -1013,6 +1027,9 @@ jvirt_barray_ptr* jpegli_read_coefficients(j_decompress_ptr cinfo) {
       if (jpegli::ConsumeInput(cinfo) == JPEG_SUSPENDED) {
         return nullptr;
       }
+    }
+    if (!jpegli::AmdVulkanDecodeCoefficientsFinish(cinfo)) {
+      JPEGLI_ERROR("Failed to reconstruct progressive coefficients");
     }
     cinfo->output_scanline = cinfo->output_height;
   }

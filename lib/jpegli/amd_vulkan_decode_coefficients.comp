@@ -1,0 +1,53 @@
+#version 460
+
+// Direct AMD UMA progressive coefficient reconstruction. Entropy parsing on
+// the CPU emits sparse additive events. Initial values and signed AC
+// refinement deltas commute, so one atomic scatter produces final int32
+// coefficients; a second mode packs pairs to the libjpeg int16 ABI.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct CoefficientEvent {
+  uint coefficient_index;
+  int delta;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer EventBuffer {
+  CoefficientEvent events[];
+};
+
+layout(std430, set = 0, binding = 1) buffer AccumulatorBuffer {
+  int coefficients[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer PackedBuffer {
+  uint packed_coefficients[];
+};
+
+layout(push_constant) uniform PushConstants {
+  uint event_count;
+  uint coefficient_count;
+  uint mode;
+  uint base_index;
+} pc;
+
+void main() {
+  const uint index = pc.base_index + gl_GlobalInvocationID.x;
+  if (pc.mode == 0u) {
+    if (index >= pc.event_count) return;
+    const CoefficientEvent event = events[index];
+    if (event.coefficient_index < pc.coefficient_count) {
+      atomicAdd(coefficients[event.coefficient_index], event.delta);
+    }
+    return;
+  }
+
+  const uint coefficient0 = index * 2u;
+  if (coefficient0 >= pc.coefficient_count) return;
+  const uint low = uint(coefficients[coefficient0]) & 0xffffu;
+  uint high = 0u;
+  if (coefficient0 + 1u < pc.coefficient_count) {
+    high = (uint(coefficients[coefficient0 + 1u]) & 0xffffu) << 16u;
+  }
+  packed_coefficients[index] = low | high;
+}

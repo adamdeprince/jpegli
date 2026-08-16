@@ -13,6 +13,7 @@
 
 #include "jpeglib.h"
 #include "lib/base/compiler_specific.h"
+#include "lib/jpegli/amd_vulkan_decode_coefficients.h"
 #include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/huffman.h"
 #include "lib/jpegli/types.h"
@@ -33,6 +34,11 @@ struct MCUCodingState {
   coeff_t last_dc_coeff[kMaxComponents];
   int eobrun;
   coeff_t coeffs[D_MAX_BLOCKS_IN_MCU * DCTSIZE2];
+  size_t amd_decode_event_count;
+  size_t amd_decode_num_blocks;
+  size_t amd_decode_block_index[D_MAX_BLOCKS_IN_MCU];
+  uint64_t amd_decode_significant[D_MAX_BLOCKS_IN_MCU];
+  uint64_t amd_decode_negative[D_MAX_BLOCKS_IN_MCU];
 };
 
 }  // namespace jpegli
@@ -56,6 +62,20 @@ struct jpeg_decomp_master {
   // Coefficient buffers
   jvirt_barray_ptr* coef_arrays;
   JBLOCKARRAY coeff_rows[jpegli::kMaxComponents];
+
+  // Experimental progressive entropy/event split. The CPU tracks only the
+  // significance and sign information needed to consume refinement scans.
+  // Final coefficient values are reconstructed after EOI from additive events.
+  bool amd_decode_coefficients_active_;
+  bool amd_decode_coefficients_gpu_;
+  bool amd_decode_coefficients_reconstructed_;
+  size_t amd_decode_total_blocks_;
+  size_t amd_decode_total_coefficients_;
+  size_t amd_decode_component_block_offsets_[jpegli::kMaxComponents];
+  std::vector<uint64_t> amd_decode_significant_;
+  std::vector<uint64_t> amd_decode_negative_;
+  std::vector<jpegli::AmdVulkanDecodeCoefficientEvent>
+      amd_decode_coefficient_events_;
 
   bool streaming_mode_;
 

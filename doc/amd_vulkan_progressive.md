@@ -157,6 +157,37 @@ kernel should be expected to contend during the JPEG batch rather than run
 with literally zero slowdown. The 8060S is expected to have more headroom but
 still needs the same measurement on Strix Halo hardware.
 
+## Progressive decoder coefficient experiment
+
+The decoder has a separate, opt-in coefficient-reconstruction experiment:
+
+- `JPEGLI_AMD_VULKAN_DECODE_COEFFICIENTS=force` enables the GPU path.
+- `JPEGLI_AMD_VULKAN_DECODE_COEFFICIENTS=cpu` uses the same event-forming
+  entropy parser but reconstructs on the CPU as an architecture control.
+- unset, `0`, `off`, or `false` leaves the original decoder loop unchanged.
+
+The serial CPU Huffman parser keeps one significance and sign mask per block.
+Initial values and asserted refinement bits become eight-byte
+`(coefficient_index, signed_delta)` events. Since each successive-approximation
+bit contributes a distinct signed power of two, the events commute. A single
+GPU submission clears an int32 coefficient plane, atomically accumulates all
+events from all scans, and packs pairs to Jpegli's int16 coefficient ABI.
+
+The event input and packed output use host-cached coherent storage; the GPU-only
+int32 accumulator prefers device-local coherent storage. The decoder falls back
+to exact CPU event reconstruction if device initialization or submission fails.
+Buffered-image progressive output remains on the stock path because it can
+render incomplete scans before EOI.
+
+This experiment is disabled by default because the measured end-to-end result
+is negative. On the 86.25 MP quality-75 4:2:0 corpus, full-resolution
+progressive latency was 581.85 ms on the stock path, 767.08 ms with CPU events,
+and 718.13 ms with GPU events. The GPU reduced separated event finalization from
+133.38 to 65.34 ms, but event formation, upload, synchronization, and readback
+left the complete decoder 23.4% slower than stock. Even subtracting all readback
+leaves it 21.2% slower. The retained measurements are therefore evidence that
+coefficient reconstruction alone is too narrow a decoder GPU boundary.
+
 ## Current scope
 
 - Initial progressive AC token formation: GPU

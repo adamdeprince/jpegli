@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <hwy/base.h>  // HWY_ALIGN_MAX
+#include <limits>
 
 #include "lib/base/status.h"
 #include "lib/jpegli/common.h"
@@ -173,11 +174,196 @@ int HuffExtend(int x, int s) {
   }
 }
 
+constexpr size_t kInvalidAmdDecodeBlock = std::numeric_limits<size_t>::max();
+
+bool RecordsAmdDecodeEvents(const jpeg_decomp_master* m, size_t block_index) {
+  return m->amd_decode_coefficients_active_ &&
+         block_index != kInvalidAmdDecodeBlock;
+}
+
+void RecordAmdDecodeDelta(jpeg_decomp_master* m, size_t block_index,
+                          int coefficient, int delta) {
+  if (delta == 0 || !RecordsAmdDecodeEvents(m, block_index)) return;
+  const size_t coefficient_index = block_index * DCTSIZE2 + coefficient;
+  JPEGLI_DASSERT(coefficient_index < m->amd_decode_total_coefficients_);
+  JPEGLI_DASSERT(coefficient_index <= std::numeric_limits<uint32_t>::max());
+  m->amd_decode_coefficient_events_.push_back(
+      {static_cast<uint32_t>(coefficient_index), delta});
+}
+
+void RecordAmdDecodeInitial(jpeg_decomp_master* m, size_t block_index,
+                            int coefficient, int value) {
+  if (value == 0 || !RecordsAmdDecodeEvents(m, block_index)) return;
+  const uint64_t bit = uint64_t{1} << coefficient;
+  m->amd_decode_significant_[block_index] |= bit;
+  if (value < 0) {
+    m->amd_decode_negative_[block_index] |= bit;
+  }
+  RecordAmdDecodeDelta(m, block_index, coefficient, value);
+}
+
+bool AmdDecodeCoefficientIsSignificant(const jpeg_decomp_master* m,
+                                       size_t block_index, int coefficient) {
+  JPEGLI_DASSERT(RecordsAmdDecodeEvents(m, block_index));
+  return (m->amd_decode_significant_[block_index] >> coefficient) & 1u;
+}
+
+void RecordAmdDecodeACRefinement(jpeg_decomp_master* m, size_t block_index,
+                                 int coefficient, int magnitude) {
+  const uint64_t bit = uint64_t{1} << coefficient;
+  const int delta = (m->amd_decode_negative_[block_index] & bit) != 0
+                        ? -magnitude
+                        : magnitude;
+  RecordAmdDecodeDelta(m, block_index, coefficient, delta);
+}
+
+// Keep the stock coefficient path isolated from all experimental bookkeeping.
+// This is intentionally the original decoder loop so disabling the GPU path
+// does not add a mode check for every progressive coefficient.
+bool DecodeDCTBlockCpu(const HuffmanTableEntry* dc_huff,
+                       const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
+                       int* eobrun, BitReaderState* br, coeff_t* last_dc_coeff,
+                       coeff_t* coeffs) {
+  int Am = 1 << Al;
+  bool eobrun_allowed = Ss > 0;
+  if (Ss == 0) {
+    int s = ReadSymbol(dc_huff, br);
+    if (s >= kJpegDCAlphabetSize) return false;
+    int diff = 0;
+    if (s > 0) {
+      int bits = br->ReadBits(s);
+      diff = HuffExtend(bits, s);
+    }
+    int coeff = diff + *last_dc_coeff;
+    const int dc_coeff = coeff * Am;
+    coeffs[0] = dc_coeff;
+    if (dc_coeff != coeffs[0]) return false;
+    *last_dc_coeff = coeff;
+    ++Ss;
+  }
+  if (Ss > Se) return true;
+  if (*eobrun > 0) {
+    --(*eobrun);
+    return true;
+  }
+  for (int k = Ss; k <= Se; k++) {
+    int sr = ReadSymbol(ac_huff, br);
+    if (sr >= kJpegHuffmanAlphabetSize) return false;
+    int r = sr >> 4;
+    int s = sr & 15;
+    if (s > 0) {
+      k += r;
+      if (k > Se || s + Al >= kJpegDCAlphabetSize) return false;
+      int bits = br->ReadBits(s);
+      int coeff = HuffExtend(bits, s);
+      coeffs[kJPEGNaturalOrder[k]] = coeff * Am;
+    } else if (r == 15) {
+      k += 15;
+    } else {
+      *eobrun = 1 << r;
+      if (r > 0) {
+        if (!eobrun_allowed) return false;
+        *eobrun += br->ReadBits(r);
+      }
+      break;
+    }
+  }
+  --(*eobrun);
+  return true;
+}
+
+bool RefineDCTBlockCpu(const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
+                       int* eobrun, BitReaderState* br, coeff_t* coeffs) {
+  int Am = 1 << Al;
+  bool eobrun_allowed = Ss > 0;
+  if (Ss == 0) {
+    int s = br->ReadBits(1);
+    coeff_t dc_coeff = coeffs[0];
+    dc_coeff |= s * Am;
+    coeffs[0] = dc_coeff;
+    ++Ss;
+  }
+  if (Ss > Se) return true;
+  int p1 = Am;
+  int m1 = -Am;
+  int k = Ss;
+  int r;
+  int s;
+  bool in_zero_run = false;
+  if (*eobrun <= 0) {
+    for (; k <= Se; k++) {
+      s = ReadSymbol(ac_huff, br);
+      if (s >= kJpegHuffmanAlphabetSize) return false;
+      r = s >> 4;
+      s &= 15;
+      if (s) {
+        if (s != 1) return false;
+        s = br->ReadBits(1) ? p1 : m1;
+        in_zero_run = false;
+      } else {
+        if (r != 15) {
+          *eobrun = 1 << r;
+          if (r > 0) {
+            if (!eobrun_allowed) return false;
+            *eobrun += br->ReadBits(r);
+          }
+          break;
+        }
+        in_zero_run = true;
+      }
+      do {
+        coeff_t thiscoef = coeffs[kJPEGNaturalOrder[k]];
+        if (thiscoef != 0) {
+          if (br->ReadBits(1)) {
+            if ((thiscoef & p1) == 0) {
+              if (thiscoef >= 0) {
+                thiscoef += p1;
+              } else {
+                thiscoef += m1;
+              }
+            }
+          }
+          coeffs[kJPEGNaturalOrder[k]] = thiscoef;
+        } else if (--r < 0) {
+          break;
+        }
+        k++;
+      } while (k <= Se);
+      if (s) {
+        if (k > Se) return false;
+        coeffs[kJPEGNaturalOrder[k]] = s;
+      }
+    }
+  }
+  if (in_zero_run) return false;
+  if (*eobrun > 0) {
+    for (; k <= Se; k++) {
+      coeff_t thiscoef = coeffs[kJPEGNaturalOrder[k]];
+      if (thiscoef != 0) {
+        if (br->ReadBits(1)) {
+          if ((thiscoef & p1) == 0) {
+            if (thiscoef >= 0) {
+              thiscoef += p1;
+            } else {
+              thiscoef += m1;
+            }
+          }
+        }
+        coeffs[kJPEGNaturalOrder[k]] = thiscoef;
+      }
+    }
+  }
+  --(*eobrun);
+  return true;
+}
+
 // Decodes one 8x8 block of DCT coefficients from the bit stream.
+template <bool kRecordEvents>
 bool DecodeDCTBlock(const HuffmanTableEntry* dc_huff,
                     const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
                     int* eobrun, BitReaderState* br, coeff_t* last_dc_coeff,
-                    coeff_t* coeffs) {
+                    coeff_t* coeffs, jpeg_decomp_master* m,
+                    size_t block_index) {
   // Nowadays multiplication is even faster than variable shift.
   int Am = 1 << Al;
   bool eobrun_allowed = Ss > 0;
@@ -193,10 +379,14 @@ bool DecodeDCTBlock(const HuffmanTableEntry* dc_huff,
     }
     int coeff = diff + *last_dc_coeff;
     const int dc_coeff = coeff * Am;
-    coeffs[0] = dc_coeff;
-    // TODO(eustas): is there a more elegant / explicit way to check this?
-    if (dc_coeff != coeffs[0]) {
+    if (dc_coeff < std::numeric_limits<coeff_t>::min() ||
+        dc_coeff > std::numeric_limits<coeff_t>::max()) {
       return false;
+    }
+    if constexpr (kRecordEvents) {
+      RecordAmdDecodeInitial(m, block_index, 0, dc_coeff);
+    } else {
+      coeffs[0] = dc_coeff;
     }
     *last_dc_coeff = coeff;
     ++Ss;
@@ -225,7 +415,13 @@ bool DecodeDCTBlock(const HuffmanTableEntry* dc_huff,
       }
       int bits = br->ReadBits(s);
       int coeff = HuffExtend(bits, s);
-      coeffs[kJPEGNaturalOrder[k]] = coeff * Am;
+      const int coefficient = kJPEGNaturalOrder[k];
+      const int value = coeff * Am;
+      if constexpr (kRecordEvents) {
+        RecordAmdDecodeInitial(m, block_index, coefficient, value);
+      } else {
+        coeffs[coefficient] = value;
+      }
     } else if (r == 15) {
       k += 15;
     } else {
@@ -243,16 +439,22 @@ bool DecodeDCTBlock(const HuffmanTableEntry* dc_huff,
   return true;
 }
 
+template <bool kRecordEvents>
 bool RefineDCTBlock(const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
-                    int* eobrun, BitReaderState* br, coeff_t* coeffs) {
+                    int* eobrun, BitReaderState* br, coeff_t* coeffs,
+                    jpeg_decomp_master* m, size_t block_index) {
   // Nowadays multiplication is even faster than variable shift.
   int Am = 1 << Al;
   bool eobrun_allowed = Ss > 0;
   if (Ss == 0) {
     int s = br->ReadBits(1);
-    coeff_t dc_coeff = coeffs[0];
-    dc_coeff |= s * Am;
-    coeffs[0] = dc_coeff;
+    if constexpr (kRecordEvents) {
+      if (s != 0) RecordAmdDecodeDelta(m, block_index, 0, Am);
+    } else {
+      coeff_t dc_coeff = coeffs[0];
+      dc_coeff |= s * Am;
+      coeffs[0] = dc_coeff;
+    }
     ++Ss;
   }
   if (Ss > Se) {
@@ -292,18 +494,30 @@ bool RefineDCTBlock(const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
         in_zero_run = true;
       }
       do {
-        coeff_t thiscoef = coeffs[kJPEGNaturalOrder[k]];
-        if (thiscoef != 0) {
-          if (br->ReadBits(1)) {
-            if ((thiscoef & p1) == 0) {
-              if (thiscoef >= 0) {
-                thiscoef += p1;
-              } else {
-                thiscoef += m1;
+        const int coefficient = kJPEGNaturalOrder[k];
+        bool significant;
+        if constexpr (kRecordEvents) {
+          significant =
+              AmdDecodeCoefficientIsSignificant(m, block_index, coefficient);
+        } else {
+          significant = coeffs[coefficient] != 0;
+        }
+        if (significant) {
+          if (br->ReadBits(1) != 0) {
+            if constexpr (kRecordEvents) {
+              RecordAmdDecodeACRefinement(m, block_index, coefficient, p1);
+            } else {
+              coeff_t thiscoef = coeffs[coefficient];
+              if ((thiscoef & p1) == 0) {
+                if (thiscoef >= 0) {
+                  thiscoef += p1;
+                } else {
+                  thiscoef += m1;
+                }
               }
+              coeffs[coefficient] = thiscoef;
             }
           }
-          coeffs[kJPEGNaturalOrder[k]] = thiscoef;
         } else {
           if (--r < 0) {
             break;
@@ -315,7 +529,12 @@ bool RefineDCTBlock(const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
         if (k > Se) {
           return false;
         }
-        coeffs[kJPEGNaturalOrder[k]] = s;
+        const int coefficient = kJPEGNaturalOrder[k];
+        if constexpr (kRecordEvents) {
+          RecordAmdDecodeInitial(m, block_index, coefficient, s);
+        } else {
+          coeffs[coefficient] = s;
+        }
       }
     }
   }
@@ -324,18 +543,30 @@ bool RefineDCTBlock(const HuffmanTableEntry* ac_huff, int Ss, int Se, int Al,
   }
   if (*eobrun > 0) {
     for (; k <= Se; k++) {
-      coeff_t thiscoef = coeffs[kJPEGNaturalOrder[k]];
-      if (thiscoef != 0) {
-        if (br->ReadBits(1)) {
-          if ((thiscoef & p1) == 0) {
-            if (thiscoef >= 0) {
-              thiscoef += p1;
-            } else {
-              thiscoef += m1;
+      const int coefficient = kJPEGNaturalOrder[k];
+      bool significant;
+      if constexpr (kRecordEvents) {
+        significant =
+            AmdDecodeCoefficientIsSignificant(m, block_index, coefficient);
+      } else {
+        significant = coeffs[coefficient] != 0;
+      }
+      if (significant) {
+        if (br->ReadBits(1) != 0) {
+          if constexpr (kRecordEvents) {
+            RecordAmdDecodeACRefinement(m, block_index, coefficient, p1);
+          } else {
+            coeff_t thiscoef = coeffs[coefficient];
+            if ((thiscoef & p1) == 0) {
+              if (thiscoef >= 0) {
+                thiscoef += p1;
+              } else {
+                thiscoef += m1;
+              }
             }
+            coeffs[coefficient] = thiscoef;
           }
         }
-        coeffs[kJPEGNaturalOrder[k]] = thiscoef;
       }
     }
   }
@@ -347,6 +578,35 @@ void SaveMCUCodingState(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
   memcpy(m->mcu_.last_dc_coeff, m->last_dc_coeff_, sizeof(m->last_dc_coeff_));
   m->mcu_.eobrun = m->eobrun_;
+  if (m->amd_decode_coefficients_active_) {
+    m->mcu_.amd_decode_event_count = m->amd_decode_coefficient_events_.size();
+    m->mcu_.amd_decode_num_blocks = 0;
+    for (int i = 0; i < cinfo->comps_in_scan; ++i) {
+      const jpeg_component_info* comp = cinfo->cur_comp_info[i];
+      const int c = comp->component_index;
+      const size_t block_x = m->scan_mcu_col_ * comp->MCU_width;
+      for (int iy = 0; iy < comp->MCU_height; ++iy) {
+        const size_t block_y = m->scan_mcu_row_ * comp->MCU_height + iy;
+        if (block_y >= comp->height_in_blocks) continue;
+        const size_t nblocks =
+            std::min<size_t>(comp->MCU_width, comp->width_in_blocks - block_x);
+        for (size_t ix = 0; ix < nblocks; ++ix) {
+          const size_t saved = m->mcu_.amd_decode_num_blocks;
+          JPEGLI_DASSERT(saved < D_MAX_BLOCKS_IN_MCU);
+          ++m->mcu_.amd_decode_num_blocks;
+          const size_t block_index = m->amd_decode_component_block_offsets_[c] +
+                                     block_y * comp->width_in_blocks + block_x +
+                                     ix;
+          m->mcu_.amd_decode_block_index[saved] = block_index;
+          m->mcu_.amd_decode_significant[saved] =
+              m->amd_decode_significant_[block_index];
+          m->mcu_.amd_decode_negative[saved] =
+              m->amd_decode_negative_[block_index];
+        }
+      }
+    }
+    return;
+  }
   size_t offset = 0;
   for (int i = 0; i < cinfo->comps_in_scan; ++i) {
     const jpeg_component_info* comp = cinfo->cur_comp_info[i];
@@ -372,6 +632,16 @@ void RestoreMCUCodingState(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
   memcpy(m->last_dc_coeff_, m->mcu_.last_dc_coeff, sizeof(m->last_dc_coeff_));
   m->eobrun_ = m->mcu_.eobrun;
+  if (m->amd_decode_coefficients_active_) {
+    m->amd_decode_coefficient_events_.resize(m->mcu_.amd_decode_event_count);
+    for (size_t i = 0; i < m->mcu_.amd_decode_num_blocks; ++i) {
+      const size_t block_index = m->mcu_.amd_decode_block_index[i];
+      m->amd_decode_significant_[block_index] =
+          m->mcu_.amd_decode_significant[i];
+      m->amd_decode_negative_[block_index] = m->mcu_.amd_decode_negative[i];
+    }
+    return;
+  }
   size_t offset = 0;
   for (int i = 0; i < cinfo->comps_in_scan; ++i) {
     const jpeg_component_info* comp = cinfo->cur_comp_info[i];
@@ -435,8 +705,9 @@ void PrepareForiMCURow(j_decompress_ptr cinfo) {
   }
 }
 
-int ProcessScan(j_decompress_ptr cinfo, const uint8_t* const data,
-                const size_t len, size_t* pos, size_t* bit_pos) {
+template <bool kRecordEvents>
+int ProcessScanImpl(j_decompress_ptr cinfo, const uint8_t* const data,
+                    const size_t len, size_t* pos, size_t* bit_pos) {
   if (len == 0) {
     return kNeedMoreInput;
   }
@@ -491,6 +762,7 @@ int ProcessScan(j_decompress_ptr cinfo, const uint8_t* const data,
         for (int ix = 0; ix < comp->MCU_width; ++ix) {
           size_t block_x = m->scan_mcu_col_ * comp->MCU_width + ix;
           coeff_t* coeffs;
+          size_t amd_decode_block_index = kInvalidAmdDecodeBlock;
           if (block_x >= comp->width_in_blocks ||
               block_y >= comp->height_in_blocks) {
             // Note that it is OK that sink_block is uninitialized because
@@ -500,17 +772,38 @@ int ProcessScan(j_decompress_ptr cinfo, const uint8_t* const data,
             coeffs = sink_block;
           } else {
             coeffs = &m->coeff_rows[c][biy][block_x][0];
+            if constexpr (kRecordEvents) {
+              amd_decode_block_index =
+                  m->amd_decode_component_block_offsets_[c] +
+                  block_y * comp->width_in_blocks + block_x;
+            }
           }
           if (cinfo->Ah == 0) {
-            if (!DecodeDCTBlock(dc_lut, ac_lut, cinfo->Ss, cinfo->Se, cinfo->Al,
-                                &m->eobrun_, &br,
-                                &m->last_dc_coeff_[comp->component_index],
-                                coeffs)) {
+            bool decoded;
+            if constexpr (kRecordEvents) {
+              decoded = DecodeDCTBlock<true>(
+                  dc_lut, ac_lut, cinfo->Ss, cinfo->Se, cinfo->Al, &m->eobrun_,
+                  &br, &m->last_dc_coeff_[comp->component_index], coeffs, m,
+                  amd_decode_block_index);
+            } else {
+              decoded = DecodeDCTBlockCpu(
+                  dc_lut, ac_lut, cinfo->Ss, cinfo->Se, cinfo->Al, &m->eobrun_,
+                  &br, &m->last_dc_coeff_[comp->component_index], coeffs);
+            }
+            if (!decoded) {
               scan_ok = false;
             }
           } else {
-            if (!RefineDCTBlock(ac_lut, cinfo->Ss, cinfo->Se, cinfo->Al,
-                                &m->eobrun_, &br, coeffs)) {
+            bool decoded;
+            if constexpr (kRecordEvents) {
+              decoded = RefineDCTBlock<true>(ac_lut, cinfo->Ss, cinfo->Se,
+                                             cinfo->Al, &m->eobrun_, &br,
+                                             coeffs, m, amd_decode_block_index);
+            } else {
+              decoded = RefineDCTBlockCpu(ac_lut, cinfo->Ss, cinfo->Se,
+                                          cinfo->Al, &m->eobrun_, &br, coeffs);
+            }
+            if (!decoded) {
               scan_ok = false;
             }
           }
@@ -566,6 +859,13 @@ int ProcessScan(j_decompress_ptr cinfo, const uint8_t* const data,
     return JPEG_ROW_COMPLETED;
   }
   return JPEG_SCAN_COMPLETED;
+}
+
+int ProcessScan(j_decompress_ptr cinfo, const uint8_t* const data,
+                const size_t len, size_t* pos, size_t* bit_pos) {
+  return cinfo->master->amd_decode_coefficients_active_
+             ? ProcessScanImpl<true>(cinfo, data, len, pos, bit_pos)
+             : ProcessScanImpl<false>(cinfo, data, len, pos, bit_pos);
 }
 
 }  // namespace jpegli
