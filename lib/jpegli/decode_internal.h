@@ -7,13 +7,16 @@
 #ifndef JPEGLI_LIB_JPEGLI_DECODE_INTERNAL_H_
 #define JPEGLI_LIB_JPEGLI_DECODE_INTERNAL_H_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
 #include "jpeglib.h"
 #include "lib/base/compiler_specific.h"
+#include "lib/jpegli/apple_metal.h"
 #include "lib/jpegli/common_internal.h"
+#include "lib/jpegli/decode_profile.h"
 #include "lib/jpegli/huffman.h"
 #include "lib/jpegli/types.h"
 
@@ -153,6 +156,54 @@ struct jpeg_decomp_master {
   // i.e. the bottom half when rendering incomplete scans.
   int (*coef_bits_latch)[SAVED_COEFS];
   int (*prev_coef_bits_latch)[SAVED_COEFS];
+
+  bool decode_profile_enabled_ = false;
+  jpegli::DecodeProfile decode_profile_ = {};
+
+  // Apple Metal reconstruction is opaque here so CPU-only builds do not pull
+  // Objective-C or Metal types into the decoder ABI.
+  void* apple_metal_decoder_ = nullptr;
+  JpegliAppleMetalMode apple_metal_mode_ = JPEGLI_APPLE_METAL_AUTO;
+  JpegliAppleMetalStats apple_metal_stats_ = {};
+  bool apple_metal_attempt_ = false;
+  bool apple_metal_active_ = false;
+  bool apple_metal_direct_ = false;
+  uint8_t* apple_metal_cpu_pixels_ = nullptr;
 };
+
+namespace jpegli {
+
+inline uint64_t DecodeProfileNow() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+class ScopedDecodeProfileTimer {
+ public:
+  ScopedDecodeProfileTimer(j_decompress_ptr cinfo, DecodeProfileStage stage)
+      : profile_(cinfo->master->decode_profile_enabled_
+                     ? &cinfo->master->decode_profile_
+                     : nullptr),
+        stage_(static_cast<size_t>(stage)),
+        start_(profile_ == nullptr ? 0 : DecodeProfileNow()) {}
+
+  ~ScopedDecodeProfileTimer() {
+    if (profile_ == nullptr) return;
+    profile_->nanoseconds[stage_] += DecodeProfileNow() - start_;
+    ++profile_->calls[stage_];
+  }
+
+  ScopedDecodeProfileTimer(const ScopedDecodeProfileTimer&) = delete;
+  ScopedDecodeProfileTimer& operator=(const ScopedDecodeProfileTimer&) = delete;
+
+ private:
+  DecodeProfile* profile_;
+  size_t stage_;
+  uint64_t start_;
+};
+
+}  // namespace jpegli
 
 #endif  // JPEGLI_LIB_JPEGLI_DECODE_INTERNAL_H_

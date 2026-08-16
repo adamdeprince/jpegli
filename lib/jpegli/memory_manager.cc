@@ -187,4 +187,14 @@ void InitMemoryManager(j_common_ptr cinfo) {
   cinfo->mem = reinterpret_cast<struct jpeg_memory_mgr*>(mem);
 }
 
+uint64_t MemoryManagerCurrentBytes(j_common_ptr cinfo) {
+  if (cinfo == nullptr || cinfo->mem == nullptr) return 0;
+  return reinterpret_cast<MemoryManager*>(cinfo->mem)->total_memory_usage;
+}
+
+uint64_t MemoryManagerPeakBytes(j_common_ptr cinfo) {
+  if (cinfo == nullptr || cinfo->mem == nullptr) return 0;
+  return reinterpret_cast<MemoryManager*>(cinfo->mem)->peak_memory_usage;
+}
+
 }  // namespace jpegli

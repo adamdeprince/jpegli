@@ -21,11 +21,11 @@
 #ifndef JPEGLI_LIB_JPEGLI_DECODE_H_
 #define JPEGLI_LIB_JPEGLI_DECODE_H_
 
-#include <cstddef>
-#include <cstdio>
+#include <stddef.h>
+#include <stdio.h>
 
-#include "lib/jpegli/common.h"
-#include "lib/jpegli/types.h"
+#include "common.h"
+#include "types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,9 +38,9 @@ extern "C" {
 void jpegli_CreateDecompress(j_decompress_ptr cinfo, int version,
                              size_t structsize);
 
-void jpegli_stdio_src(j_decompress_ptr cinfo, FILE *infile);
+void jpegli_stdio_src(j_decompress_ptr cinfo, FILE* infile);
 
-void jpegli_mem_src(j_decompress_ptr cinfo, const unsigned char *inbuffer,
+void jpegli_mem_src(j_decompress_ptr cinfo, const unsigned char* inbuffer,
                     unsigned long insize /* NOLINT */);
 
 int jpegli_read_header(j_decompress_ptr cinfo, boolean require_image);
@@ -52,15 +52,15 @@ JDIMENSION jpegli_read_scanlines(j_decompress_ptr cinfo, JSAMPARRAY scanlines,
 
 JDIMENSION jpegli_skip_scanlines(j_decompress_ptr cinfo, JDIMENSION num_lines);
 
-void jpegli_crop_scanline(j_decompress_ptr cinfo, JDIMENSION *xoffset,
-                          JDIMENSION *width);
+void jpegli_crop_scanline(j_decompress_ptr cinfo, JDIMENSION* xoffset,
+                          JDIMENSION* width);
 
 boolean jpegli_finish_decompress(j_decompress_ptr cinfo);
 
 JDIMENSION jpegli_read_raw_data(j_decompress_ptr cinfo, JSAMPIMAGE data,
                                 JDIMENSION max_lines);
 
-jvirt_barray_ptr *jpegli_read_coefficients(j_decompress_ptr cinfo);
+jvirt_barray_ptr* jpegli_read_coefficients(j_decompress_ptr cinfo);
 
 boolean jpegli_has_multiple_scans(j_decompress_ptr cinfo);
 
@@ -85,8 +85,8 @@ void jpegli_set_marker_processor(j_decompress_ptr cinfo, int marker_code,
 
 boolean jpegli_resync_to_restart(j_decompress_ptr cinfo, int desired);
 
-boolean jpegli_read_icc_profile(j_decompress_ptr cinfo, JOCTET **icc_data_ptr,
-                                unsigned int *icc_data_len);
+boolean jpegli_read_icc_profile(j_decompress_ptr cinfo, JOCTET** icc_data_ptr,
+                                unsigned int* icc_data_len);
 
 void jpegli_abort_decompress(j_decompress_ptr cinfo);
 

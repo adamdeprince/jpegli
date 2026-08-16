@@ -152,6 +152,9 @@ set(JPEGLI_INTERNAL_JPEGLI_LIBJPEG_HELPER_FILES
 set(JPEGLI_INTERNAL_JPEGLI_SOURCES
   jpegli/adaptive_quantization.cc
   jpegli/adaptive_quantization.h
+  jpegli/apple_metal.h
+  jpegli/apple_metal_internal.h
+  jpegli/apple_metal_stub.cc
   jpegli/bit_writer.cc
   jpegli/bit_writer.h
   jpegli/bitstream.cc
@@ -169,6 +172,7 @@ set(JPEGLI_INTERNAL_JPEGLI_SOURCES
   jpegli/decode_internal.h
   jpegli/decode_marker.cc
   jpegli/decode_marker.h
+  jpegli/decode_profile.h
   jpegli/decode_scan.cc
   jpegli/decode_scan.h
   jpegli/destination_manager.cc
@@ -216,6 +220,7 @@ set(JPEGLI_INTERNAL_JPEGLI_TESTLIB_FILES
 )
 
 set(JPEGLI_INTERNAL_JPEGLI_TESTS
+  jpegli/apple_metal_test.cc
   jpegli/decode_api_test.cc
   jpegli/encode_api_test.cc
   jpegli/error_handling_test.cc

@@ -174,6 +174,19 @@ set(JPEGLI_ENABLE_WASM_THREADS true CACHE BOOL
     "Builds WASM modules with threads support.")
 set(JPEGLI_ENABLE_LTO false CACHE BOOL
     "Set flags to enable LTO.")
+set(JPEGLI_ENABLE_APPLE_METAL false CACHE BOOL
+    "Enable the experimental direct Apple Metal JPEG decoder backend.")
+set(JPEGLI_APPLE_METAL_PRECOMPILE_SHADERS true CACHE BOOL
+    "Embed build-time-compiled Metal shaders when the Xcode tools are available.")
+
+if(JPEGLI_ENABLE_APPLE_METAL AND NOT APPLE)
+  message(FATAL_ERROR
+    "JPEGLI_ENABLE_APPLE_METAL is only supported on Apple platforms")
+endif()
+
+if(JPEGLI_ENABLE_APPLE_METAL)
+  enable_language(OBJCXX)
+endif()
 
 # HWY codegen levers
 foreach(tgt IN LISTS JPEGLI_HWY_TARGETS)

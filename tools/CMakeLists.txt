@@ -132,6 +132,53 @@ if(MINGW)
   # MINGW doesn't support glob.h.
   target_compile_definitions(benchmark_xl PRIVATE "-DHAS_GLOB=0")
   endif() # MINGW
+
+  # This benchmark intentionally links both jpegli and libjpeg-turbo into the
+  # same process. It uses the prefixed jpegli API and the TurboJPEG API, so the
+  # two implementations do not have overlapping libjpeg symbols.
+  if(PkgConfig_FOUND)
+    pkg_check_modules(JPEGLI_TURBOJPEG QUIET IMPORTED_TARGET libturbojpeg)
+  endif()
+  if(JPEGLI_TURBOJPEG_FOUND)
+    list(APPEND INTERNAL_TOOL_BINARIES jpegli_decode_benchmark)
+    add_executable(jpegli_decode_benchmark
+      benchmark/jpegli_decode_benchmark.cc
+      ssimulacra2.cc
+    )
+    # jpegli is configured for the v6 libjpeg ABI by default. Ensure that its
+    # generated jpeglib.h wins over Homebrew's v8 header from libturbojpeg.
+    target_include_directories(jpegli_decode_benchmark BEFORE PRIVATE
+      "${PROJECT_BINARY_DIR}/lib/include/jpegli"
+    )
+    target_link_libraries(jpegli_decode_benchmark
+      PkgConfig::JPEGLI_TURBOJPEG
+      Threads::Threads
+      jpegli_gauss_blur
+    )
+    if(APPLE)
+      find_library(JPEGLI_COREFOUNDATION_FRAMEWORK CoreFoundation)
+      find_library(JPEGLI_COREGRAPHICS_FRAMEWORK CoreGraphics)
+      find_library(JPEGLI_IMAGEIO_FRAMEWORK ImageIO)
+      if(JPEGLI_COREFOUNDATION_FRAMEWORK AND
+         JPEGLI_COREGRAPHICS_FRAMEWORK AND
+         JPEGLI_IMAGEIO_FRAMEWORK)
+        target_compile_definitions(jpegli_decode_benchmark PRIVATE
+          JPEGLI_HAVE_APPLE_IMAGEIO=1
+        )
+        target_link_libraries(jpegli_decode_benchmark
+          ${JPEGLI_COREFOUNDATION_FRAMEWORK}
+          ${JPEGLI_COREGRAPHICS_FRAMEWORK}
+          ${JPEGLI_IMAGEIO_FRAMEWORK}
+        )
+      else()
+        message(FATAL_ERROR
+          "Apple frameworks required by jpegli_decode_benchmark were not found")
+      endif()
+    endif()
+  else()
+    message(STATUS
+      "Not building jpegli_decode_benchmark: libturbojpeg was not found")
+  endif()
 endif()  # JPEGLI_ENABLE_BENCHMARK
 
 # All tool binaries depend on "jpegli" library and the tool helpers.

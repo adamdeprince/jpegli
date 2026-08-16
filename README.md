@@ -41,6 +41,10 @@ Improvements and new features used by the encoder include:
   integer samples happens only in the final output phase (unless output to
   floating point was requested).
 
+* An [experimental Apple Metal decoder](doc/apple_metal_decoder.md) can move
+  final reconstruction to Apple GPUs while retaining CPU entropy decoding and
+  the libjpeg-compatible scanline API.
+
 ## Usage
 
 When [building the project](doc/building_and_testing.md), two binaries,

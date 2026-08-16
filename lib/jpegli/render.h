@@ -8,10 +8,17 @@
 #define JPEGLI_LIB_JPEGLI_RENDER_H_
 
 #include <cstddef>
+#include <cstdint>
 
 #include "lib/jpegli/common.h"
 
 namespace jpegli {
+
+void GatherBlockStats(const int16_t* coeffs, size_t coeffs_size,
+                      int32_t* nonzeros, int32_t* sumabs);
+
+void ComputeOptimalLaplacianBiases(int num_blocks, const int* nonzeros,
+                                   const int* sumabs, float* biases);
 
 void PrepareForOutput(j_decompress_ptr cinfo);
 

@@ -11,11 +11,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <hwy/aligned_allocator.h>
+#include <limits>
 #include <vector>
 
 #include "lib/base/byte_order.h"
 #include "lib/base/status.h"
 #include "lib/base/types.h"
+#include "lib/jpegli/apple_metal_internal.h"
 #include "lib/jpegli/color_quantize.h"
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/common_internal.h"
@@ -56,6 +58,14 @@ void InitializeImage(j_decompress_ptr cinfo) {
   memset(cinfo->arith_ac_K, 0, sizeof(cinfo->arith_ac_K));
   // Initialize the private fields.
   jpeg_decomp_master* m = cinfo->master;
+  AppleMetalResetDecoder(cinfo);
+  m->apple_metal_stats_ = {};
+  m->apple_metal_attempt_ = false;
+  m->apple_metal_direct_ = false;
+  m->apple_metal_cpu_pixels_ = nullptr;
+  if (m->decode_profile_enabled_) {
+    m->decode_profile_ = {};
+  }
   m->input_buffer_.clear();
   m->input_buffer_pos_ = 0;
   m->codestream_bits_ahead_ = 0;
@@ -319,8 +329,10 @@ int ConsumeInput(j_decompress_ptr cinfo) {
     }
     size_t pos = 0;
     if (cinfo->global_state == kDecProcessScan) {
+      ScopedDecodeProfileTimer timer(cinfo, DecodeProfileStage::kEntropy);
       status = ProcessScan(cinfo, data, len, &pos, &m->codestream_bits_ahead_);
     } else {
+      ScopedDecodeProfileTimer timer(cinfo, DecodeProfileStage::kMarkers);
       status = ProcessMarkers(cinfo, data, len, &pos);
     }
     if (m->input_buffer_.empty()) {
@@ -393,6 +405,7 @@ int ConsumeInput(j_decompress_ptr cinfo) {
     if (cinfo->global_state == kDecInHeader) {
       cinfo->global_state = kDecHeaderDone;
     } else {
+      ScopedDecodeProfileTimer timer(cinfo, DecodeProfileStage::kSetup);
       PrepareForScan(cinfo);
     }
   }
@@ -552,6 +565,21 @@ void AllocateOutputBuffers(j_decompress_ptr cinfo) {
   memset(m->dequant_, 0, coeffs_per_block * sizeof(float));
 }
 
+void SetDecodeProfileEnabled(j_decompress_ptr cinfo, bool enabled) {
+  cinfo->master->decode_profile_enabled_ = enabled;
+  if (enabled) {
+    cinfo->master->decode_profile_ = {};
+  }
+}
+
+void ResetDecodeProfile(j_decompress_ptr cinfo) {
+  cinfo->master->decode_profile_ = {};
+}
+
+DecodeProfile GetDecodeProfile(j_decompress_ptr cinfo) {
+  return cinfo->master->decode_profile_;
+}
+
 }  // namespace jpegli
 
 void jpegli_CreateDecompress(j_decompress_ptr cinfo, int version,
@@ -586,10 +614,16 @@ void jpegli_CreateDecompress(j_decompress_ptr cinfo, int version,
 }
 
 void jpegli_destroy_decompress(j_decompress_ptr cinfo) {
+  if (cinfo != nullptr && cinfo->master != nullptr) {
+    jpegli::AppleMetalResetDecoder(cinfo);
+  }
   jpegli_destroy(reinterpret_cast<j_common_ptr>(cinfo));
 }
 
 void jpegli_abort_decompress(j_decompress_ptr cinfo) {
+  if (cinfo != nullptr && cinfo->master != nullptr) {
+    jpegli::AppleMetalResetDecoder(cinfo);
+  }
   jpegli_abort(reinterpret_cast<j_common_ptr>(cinfo));
 }
 
@@ -795,34 +829,44 @@ boolean jpegli_input_complete(j_decompress_ptr cinfo) {
 boolean jpegli_start_decompress(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
   if (cinfo->global_state == jpegli::kDecHeaderDone) {
-    m->streaming_mode_ = !m->is_multiscan_ &&
-                         !FROM_JPEGLI_BOOL(cinfo->buffered_image) &&
-                         (!FROM_JPEGLI_BOOL(cinfo->quantize_colors) ||
-                          !FROM_JPEGLI_BOOL(cinfo->two_pass_quantize));
-    jpegli::AllocateCoefficientBuffer(cinfo);
-    jpegli_calc_output_dimensions(cinfo);
-    jpegli::PrepareForScan(cinfo);
-    if (cinfo->quantize_colors) {
-      if (cinfo->colormap != nullptr) {
-        cinfo->enable_external_quant = TRUE;
-      } else if (cinfo->two_pass_quantize &&
-                 cinfo->out_color_space == JCS_RGB) {
-        cinfo->enable_2pass_quant = TRUE;
-      } else {
-        cinfo->enable_1pass_quant = TRUE;
+    {
+      jpegli::ScopedDecodeProfileTimer timer(
+          cinfo, jpegli::DecodeProfileStage::kSetup);
+      // Output dimensions and component ratios are needed for Metal runtime
+      // selection. Selecting Metal makes the coefficient buffer image-sized,
+      // because final reconstruction begins only after entropy decoding has
+      // completed.
+      jpegli_calc_output_dimensions(cinfo);
+      m->apple_metal_attempt_ =
+          jpegli::AppleMetalShouldAttempt(cinfo, m->apple_metal_direct_);
+      m->streaming_mode_ = !m->apple_metal_attempt_ && !m->is_multiscan_ &&
+                           !FROM_JPEGLI_BOOL(cinfo->buffered_image) &&
+                           (!FROM_JPEGLI_BOOL(cinfo->quantize_colors) ||
+                            !FROM_JPEGLI_BOOL(cinfo->two_pass_quantize));
+      jpegli::AllocateCoefficientBuffer(cinfo);
+      jpegli::PrepareForScan(cinfo);
+      if (cinfo->quantize_colors) {
+        if (cinfo->colormap != nullptr) {
+          cinfo->enable_external_quant = TRUE;
+        } else if (cinfo->two_pass_quantize &&
+                   cinfo->out_color_space == JCS_RGB) {
+          cinfo->enable_2pass_quant = TRUE;
+        } else {
+          cinfo->enable_1pass_quant = TRUE;
+        }
       }
+      jpegli::InitProgressMonitor(cinfo, /*coef_only=*/false);
+      jpegli::AllocateOutputBuffers(cinfo);
     }
-    jpegli::InitProgressMonitor(cinfo, /*coef_only=*/false);
-    jpegli::AllocateOutputBuffers(cinfo);
     if (cinfo->buffered_image == TRUE) {
       cinfo->output_scan_number = 0;
       return TRUE;
     }
-  } else if (!m->is_multiscan_) {
+  } else if (!m->is_multiscan_ && !m->apple_metal_attempt_) {
     JPEGLI_ERROR("jpegli_start_decompress: unexpected state %d",
                  cinfo->global_state);
   }
-  if (m->is_multiscan_) {
+  if (m->is_multiscan_ || m->apple_metal_attempt_) {
     if (cinfo->global_state != jpegli::kDecProcessScan &&
         cinfo->global_state != jpegli::kDecProcessMarkers) {
       JPEGLI_ERROR("jpegli_start_decompress: unexpected state %d",
@@ -836,7 +880,18 @@ boolean jpegli_start_decompress(j_decompress_ptr cinfo) {
     }
   }
   cinfo->output_scan_number = cinfo->input_scan_number;
-  jpegli::PrepareForOutput(cinfo);
+  {
+    jpegli::ScopedDecodeProfileTimer timer(cinfo,
+                                           jpegli::DecodeProfileStage::kSetup);
+    jpegli::PrepareForOutput(cinfo);
+  }
+  if (m->apple_metal_attempt_ && !cinfo->quantize_colors) {
+    // A runtime failure is deliberately non-fatal: the already decoded full
+    // coefficient planes are valid input to the ordinary CPU renderer.
+    m->apple_metal_active_ =
+        jpegli::AppleMetalReconstruct(cinfo, m->apple_metal_direct_);
+    m->apple_metal_attempt_ = false;
+  }
   if (cinfo->quantize_colors) {
     return jpegli::PrepareQuantizedOutput(cinfo);
   } else {
@@ -908,6 +963,10 @@ JDIMENSION jpegli_read_scanlines(j_decompress_ptr cinfo, JSAMPARRAY scanlines,
   }
   if (cinfo->output_scanline + max_lines > cinfo->output_height) {
     max_lines = cinfo->output_height - cinfo->output_scanline;
+  }
+  if (m->apple_metal_active_) {
+    jpegli::ProgressMonitorOutputPass(cinfo);
+    return jpegli::AppleMetalReadScanlines(cinfo, scanlines, max_lines);
   }
   jpegli::ProgressMonitorOutputPass(cinfo);
   size_t num_output_rows = 0;
@@ -1072,4 +1131,115 @@ void jpegli_set_output_format(j_decompress_ptr cinfo, JpegliDataType data_type,
     default:
       JPEGLI_ERROR("Unsupported endianness %d", endianness);
   }
+}
+
+void jpegli::SetAppleMetalFallbackReason(j_decompress_ptr cinfo,
+                                         const char* reason) {
+  if (cinfo == nullptr || cinfo->master == nullptr) return;
+  char* dst = cinfo->master->apple_metal_stats_.fallback_reason;
+  if (reason == nullptr) reason = "";
+  snprintf(dst, sizeof(cinfo->master->apple_metal_stats_.fallback_reason), "%s",
+           reason);
+}
+
+void jpegli_apple_metal_set_mode(j_decompress_ptr cinfo,
+                                 JpegliAppleMetalMode mode) {
+  if (cinfo == nullptr || cinfo->master == nullptr) return;
+  switch (mode) {
+    case JPEGLI_APPLE_METAL_AUTO:
+    case JPEGLI_APPLE_METAL_DISABLED:
+    case JPEGLI_APPLE_METAL_FORCE:
+      cinfo->master->apple_metal_mode_ = mode;
+      break;
+    default:
+      JPEGLI_ERROR("Invalid Apple Metal mode %d", static_cast<int>(mode));
+  }
+}
+
+JpegliAppleMetalMode jpegli_apple_metal_get_mode(j_decompress_ptr cinfo) {
+  if (cinfo == nullptr || cinfo->master == nullptr) {
+    return JPEGLI_APPLE_METAL_DISABLED;
+  }
+  return cinfo->master->apple_metal_mode_;
+}
+
+int jpegli_apple_metal_was_used(j_decompress_ptr cinfo) {
+  return cinfo != nullptr && cinfo->master != nullptr &&
+         cinfo->master->apple_metal_stats_.used_metal;
+}
+
+void jpegli_apple_metal_get_stats(j_decompress_ptr cinfo,
+                                  JpegliAppleMetalStats* stats) {
+  if (stats == nullptr) return;
+  *stats = {};
+  if (cinfo != nullptr && cinfo->master != nullptr) {
+    *stats = cinfo->master->apple_metal_stats_;
+  }
+}
+
+boolean jpegli_start_decompress_to_apple_metal(j_decompress_ptr cinfo,
+                                               JpegliAppleMetalOutput* output) {
+  if (output == nullptr) {
+    JPEGLI_ERROR("jpegli_start_decompress_to_apple_metal: null output");
+  }
+  *output = {};
+  if (cinfo == nullptr || cinfo->master == nullptr) return FALSE;
+  if (!jpegli_apple_metal_is_available()) {
+    jpegli::SetAppleMetalFallbackReason(
+        cinfo, "Apple Metal output is unavailable on this build or device");
+    return FALSE;
+  }
+  cinfo->master->apple_metal_direct_ = true;
+  if (cinfo->buffered_image) {
+    // The direct endpoint represents one completed image. Leave incremental
+    // progressive output untouched so the caller can use
+    // jpegli_start_output()/jpegli_read_scanlines() on the CPU instead.
+    jpegli::SetAppleMetalFallbackReason(
+        cinfo, "incremental buffered-image output uses the CPU renderer");
+    return FALSE;
+  }
+  // If CPU fallback scanline rendering suspended on an earlier call, startup
+  // is already complete and must not be repeated. A pending Metal attempt, on
+  // the other hand, resumes jpegli_start_decompress() until all coefficient
+  // scans have arrived and reconstruction can run.
+  if ((cinfo->global_state != jpegli::kDecProcessScan &&
+       cinfo->global_state != jpegli::kDecProcessMarkers) ||
+      cinfo->master->apple_metal_attempt_ || cinfo->output_scan_number == 0) {
+    if (!jpegli_start_decompress(cinfo)) return FALSE;
+  }
+  if (cinfo->master->apple_metal_active_) {
+    if (!jpegli::AppleMetalExportOutput(cinfo, output)) return FALSE;
+    cinfo->output_scanline = cinfo->output_height;
+    cinfo->output_iMCU_row = cinfo->total_iMCU_rows;
+    ++cinfo->master->output_passes_done_;
+    return TRUE;
+  }
+  // Transparent fallback for modes outside the reconstruction kernel's
+  // contract. Render through the ordinary scanline path, then place the final
+  // RGBA bytes in a shared Metal allocation for the GPU consumer.
+  if (cinfo->output_components != 4 ||
+      cinfo->master->output_data_type_ != JPEGLI_TYPE_UINT8 ||
+      cinfo->quantize_colors || cinfo->raw_data_out) {
+    return FALSE;
+  }
+  size_t row_bytes = static_cast<size_t>(cinfo->output_width) * 4;
+  if (cinfo->output_width != 0 && row_bytes / 4 != cinfo->output_width) {
+    return FALSE;
+  }
+  if (cinfo->output_height != 0 &&
+      row_bytes > std::numeric_limits<size_t>::max() / cinfo->output_height) {
+    return FALSE;
+  }
+  if (cinfo->master->apple_metal_cpu_pixels_ == nullptr) {
+    cinfo->master->apple_metal_cpu_pixels_ = jpegli::Allocate<uint8_t>(
+        cinfo, row_bytes * cinfo->output_height, JPOOL_IMAGE_ALIGNED);
+  }
+  uint8_t* pixels = cinfo->master->apple_metal_cpu_pixels_;
+  while (cinfo->output_scanline < cinfo->output_height) {
+    JSAMPROW row =
+        pixels + static_cast<size_t>(cinfo->output_scanline) * row_bytes;
+    if (jpegli_read_scanlines(cinfo, &row, 1) != 1) return FALSE;
+  }
+  return TO_JPEGLI_BOOL(
+      jpegli::AppleMetalUploadCpuOutput(cinfo, pixels, row_bytes, output));
 }

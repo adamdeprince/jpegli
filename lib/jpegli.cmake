@@ -30,8 +30,90 @@ configure_file(
   ../third_party/libjpeg-turbo/jpeglib.h include/jpegli/jpeglib.h COPYONLY)
 configure_file(
   ../third_party/libjpeg-turbo/jmorecfg.h include/jpegli/jmorecfg.h COPYONLY)
+foreach(JPEGLI_PUBLIC_HEADER apple_metal.h common.h decode.h encode.h types.h)
+  configure_file(
+    jpegli/${JPEGLI_PUBLIC_HEADER}
+    include/jpegli/${JPEGLI_PUBLIC_HEADER} COPYONLY)
+endforeach()
 
-add_library(jpegli-static STATIC EXCLUDE_FROM_ALL "${JPEGLI_INTERNAL_JPEGLI_SOURCES}")
+if(JPEGLI_ENABLE_APPLE_METAL)
+  find_library(JPEGLI_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+  find_library(JPEGLI_METAL_FRAMEWORK Metal REQUIRED)
+  list(APPEND JPEGLI_INTERNAL_JPEGLI_SOURCES jpegli/apple_metal.mm)
+
+  if(JPEGLI_APPLE_METAL_PRECOMPILE_SHADERS)
+    set(JPEGLI_XCODE_TOOLCHAIN_HINTS)
+    if(DEFINED ENV{DEVELOPER_DIR})
+      list(APPEND JPEGLI_XCODE_TOOLCHAIN_HINTS
+        "$ENV{DEVELOPER_DIR}/Toolchains/XcodeDefault.xctoolchain/usr/bin")
+    endif()
+    list(APPEND JPEGLI_XCODE_TOOLCHAIN_HINTS
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin")
+    find_program(JPEGLI_METAL_COMPILER NAMES metal
+      HINTS ${JPEGLI_XCODE_TOOLCHAIN_HINTS})
+    find_program(JPEGLI_METALLIB_LINKER NAMES metallib
+      HINTS ${JPEGLI_XCODE_TOOLCHAIN_HINTS})
+    find_program(JPEGLI_XXD_EXECUTABLE NAMES xxd)
+
+    if(JPEGLI_METAL_COMPILER AND JPEGLI_METALLIB_LINKER AND
+       JPEGLI_XXD_EXECUTABLE)
+      set(JPEGLI_APPLE_METAL_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/apple_metal")
+      file(MAKE_DIRECTORY "${JPEGLI_APPLE_METAL_GENERATED_DIR}")
+      set(JPEGLI_APPLE_METAL_SOURCE
+        "${JPEGLI_APPLE_METAL_GENERATED_DIR}/jpegli_apple_metal.metal")
+      set(JPEGLI_APPLE_METAL_AIR
+        "${JPEGLI_APPLE_METAL_GENERATED_DIR}/jpegli_apple_metal.air")
+      set(JPEGLI_APPLE_METAL_LIBRARY
+        "${JPEGLI_APPLE_METAL_GENERATED_DIR}/jpegli_apple_metal.metallib")
+      set(JPEGLI_APPLE_METAL_HEADER
+        "${JPEGLI_APPLE_METAL_GENERATED_DIR}/jpegli_apple_metal_metallib.inc")
+
+      add_custom_command(
+        OUTPUT "${JPEGLI_APPLE_METAL_SOURCE}"
+        COMMAND "${CMAKE_COMMAND}"
+          "-DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/jpegli/apple_metal.mm"
+          "-DOUTPUT=${JPEGLI_APPLE_METAL_SOURCE}"
+          -P "${PROJECT_SOURCE_DIR}/cmake/ExtractMetalShader.cmake"
+        DEPENDS
+          "${CMAKE_CURRENT_SOURCE_DIR}/jpegli/apple_metal.mm"
+          "${PROJECT_SOURCE_DIR}/cmake/ExtractMetalShader.cmake"
+        VERBATIM)
+      add_custom_command(
+        OUTPUT "${JPEGLI_APPLE_METAL_AIR}"
+        COMMAND "${JPEGLI_METAL_COMPILER}"
+          -c -fmetal-math-mode=safe
+          -fmetal-math-fp32-functions=precise
+          "${JPEGLI_APPLE_METAL_SOURCE}"
+          -o "${JPEGLI_APPLE_METAL_AIR}"
+        DEPENDS "${JPEGLI_APPLE_METAL_SOURCE}"
+        VERBATIM)
+      add_custom_command(
+        OUTPUT "${JPEGLI_APPLE_METAL_LIBRARY}"
+        COMMAND "${JPEGLI_METALLIB_LINKER}"
+          "${JPEGLI_APPLE_METAL_AIR}"
+          -o "${JPEGLI_APPLE_METAL_LIBRARY}"
+        DEPENDS "${JPEGLI_APPLE_METAL_AIR}"
+        VERBATIM)
+      add_custom_command(
+        OUTPUT "${JPEGLI_APPLE_METAL_HEADER}"
+        COMMAND "${JPEGLI_XXD_EXECUTABLE}" -i
+          -n kJpegliAppleMetalLibraryBytes
+          "${JPEGLI_APPLE_METAL_LIBRARY}"
+          "${JPEGLI_APPLE_METAL_HEADER}"
+        DEPENDS "${JPEGLI_APPLE_METAL_LIBRARY}"
+        VERBATIM)
+      add_custom_target(jpegli-apple-metal-shader
+        DEPENDS "${JPEGLI_APPLE_METAL_HEADER}")
+      message(STATUS "JPEGli: embedding precompiled Apple Metal shaders")
+    else()
+      message(STATUS
+        "JPEGli: Xcode Metal tools unavailable; shaders will compile lazily")
+    endif()
+  endif()
+endif()
+
+add_library(jpegli-static STATIC "${JPEGLI_INTERNAL_JPEGLI_SOURCES}")
 target_compile_options(jpegli-static PRIVATE "${JPEGLI_INTERNAL_FLAGS}")
 target_compile_options(jpegli-static PUBLIC ${JPEGLI_COVERAGE_FLAGS})
 set_property(TARGET jpegli-static PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -41,8 +123,28 @@ target_include_directories(jpegli-static PRIVATE
 )
 target_include_directories(jpegli-static PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include/jpegli>"
+  "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/jpegli>"
 )
 target_link_libraries(jpegli-static PUBLIC ${JPEGLI_INTERNAL_LIBS})
+if(JPEGLI_ENABLE_APPLE_METAL)
+  target_compile_definitions(jpegli-static PRIVATE
+    JPEGLI_ENABLE_APPLE_METAL=1)
+  if(TARGET jpegli-apple-metal-shader)
+    add_dependencies(jpegli-static jpegli-apple-metal-shader)
+    target_include_directories(jpegli-static PRIVATE
+      "${JPEGLI_APPLE_METAL_GENERATED_DIR}")
+    target_compile_definitions(jpegli-static PRIVATE
+      JPEGLI_APPLE_METAL_PRECOMPILED_LIBRARY=1)
+  endif()
+  set_source_files_properties(jpegli/apple_metal.mm PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc")
+  target_link_libraries(jpegli-static PUBLIC
+    ${JPEGLI_FOUNDATION_FRAMEWORK}
+    ${JPEGLI_METAL_FRAMEWORK})
+endif()
+
+install(TARGETS jpegli-static
+  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 
 #
 # Tests for jpegli-static

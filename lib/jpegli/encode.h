@@ -21,11 +21,11 @@
 #ifndef JPEGLI_LIB_JPEGLI_ENCODE_H_
 #define JPEGLI_LIB_JPEGLI_ENCODE_H_
 
-#include <cstddef>
-#include <cstdio>
+#include <stddef.h>
+#include <stdio.h>
 
-#include "lib/jpegli/common.h"
-#include "lib/jpegli/types.h"
+#include "common.h"
+#include "types.h"
 
 #ifdef __cplusplus
 extern "C" {

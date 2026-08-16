@@ -7,6 +7,7 @@
 #ifndef JPEGLI_LIB_JPEGLI_MEMORY_MANAGER_H_
 #define JPEGLI_LIB_JPEGLI_MEMORY_MANAGER_H_
 
+#include <cstdint>
 #include <cstdlib>
 
 #include "lib/jpegli/common.h"
@@ -17,6 +18,9 @@
 namespace jpegli {
 
 void InitMemoryManager(j_common_ptr cinfo);
+
+uint64_t MemoryManagerCurrentBytes(j_common_ptr cinfo);
+uint64_t MemoryManagerPeakBytes(j_common_ptr cinfo);
 
 template <typename T>
 T* Allocate(j_common_ptr cinfo, size_t len, int pool_id = JPOOL_PERMANENT) {

@@ -21,7 +21,13 @@
 #ifndef JPEGLI_LIB_JPEGLI_COMMON_H_
 #define JPEGLI_LIB_JPEGLI_COMMON_H_
 
-#include "lib/base/include_jpeglib.h"  // IWYU pragma: export
+// jpeglib.h requires the FILE and size_t declarations to be visible first.
+// Keep this public header self-contained both in the source tree and after
+// installation.
+#include <stddef.h>
+#include <stdio.h>
+
+#include "jpeglib.h"  // IWYU pragma: export
 
 #ifdef __cplusplus
 extern "C" {
