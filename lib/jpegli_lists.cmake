@@ -169,6 +169,9 @@ set(JPEGLI_INTERNAL_JPEGLI_SOURCES
   jpegli/decode.cc
   jpegli/decode.h
   jpegli/decode_internal.h
+  jpegli/decode_stage_profile.cc
+  jpegli/decode_stage_profile.h
+  jpegli/decode_stage_profile_internal.h
   jpegli/decode_marker.cc
   jpegli/decode_marker.h
   jpegli/decode_scan.cc

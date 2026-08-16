@@ -160,6 +160,8 @@ set(JPEGLI_ENABLE_TCMALLOC ${ENABLE_TCMALLOC_DEFAULT} CACHE BOOL
     "Build JPEGLI using gperftools (tcmalloc) allocator.")
 set(JPEGLI_ENABLE_COVERAGE false CACHE BOOL
     "Enable code coverage tracking for libjpegli. This also enables debug and disables optimizations.")
+set(JPEGLI_ENABLE_DECODE_STAGE_PROFILING false CACHE BOOL
+    "Build opt-in Jpegli decoder stage timing instrumentation.")
 set(JPEGLI_STATIC false CACHE BOOL
     "Build tools as static binaries.")
 set(JPEGLI_WARNINGS_AS_ERRORS false CACHE BOOL

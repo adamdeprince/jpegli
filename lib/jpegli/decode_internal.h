@@ -37,9 +37,14 @@ struct MCUCodingState {
 
 }  // namespace jpegli
 
+struct jpegli_decode_stage_profile;
+
 // Use this forward-declared libjpeg struct to hold all our private variables.
 // TODO(szabadka) Remove variables that have a corresponding version in cinfo.
 struct jpeg_decomp_master {
+  jpegli_decode_stage_profile* decode_stage_profile;
+  uint64_t decode_stage_profile_start_ns;
+
   //
   // Input handling state.
   //

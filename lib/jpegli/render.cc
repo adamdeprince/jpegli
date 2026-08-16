@@ -22,6 +22,7 @@
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/decode_internal.h"
+#include "lib/jpegli/decode_stage_profile_internal.h"
 #include "lib/jpegli/error.h"
 #include "lib/jpegli/idct.h"
 #include "lib/jpegli/types.h"
@@ -556,6 +557,8 @@ void PredictSmooth(j_decompress_ptr cinfo, JBLOCKARRAY blocks, int component,
 
 void PrepareForOutput(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
+  DecodeStageProfileTimer profile_timer(
+      m->decode_stage_profile, JPEGLI_DECODE_STAGE_OUTPUT_PREPARATION);
   bool smoothing = do_smoothing(cinfo);
   m->apply_smoothing = smoothing && FROM_JPEGLI_BOOL(cinfo->do_block_smoothing);
   size_t coeffs_per_block = cinfo->num_components * DCTSIZE2;
@@ -580,6 +583,9 @@ void PrepareForOutput(j_decompress_ptr cinfo) {
 
 void DecodeCurrentiMCURow(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
+  DecodeStageProfileTimer profile_timer(
+      m->decode_stage_profile,
+      JPEGLI_DECODE_STAGE_DEQUANT_BIAS_SMOOTHING_AND_IDCT);
   const size_t imcu_row = cinfo->output_iMCU_row;
   JBLOCKARRAY blocks[kMaxComponents];
   for (int c = 0; c < cinfo->num_components; ++c) {
@@ -692,44 +698,48 @@ void ProcessOutput(j_decompress_ptr cinfo, size_t* num_output_rows,
     size_t yb = (ybegin / vfactor) * vfactor;
     size_t ye = DivCeil(yend, vfactor) * vfactor;
     for (size_t y = yb; y < ye; y += vfactor) {
-      for (int c = 0; c < cinfo->num_components; ++c) {
-        RowBuffer<float>* raw_out = &m->raw_output_[c];
-        RowBuffer<float>* render_out = &m->render_output_[c];
-        int line_groups = vfactor / m->v_factor[c];
-        int downsampled_width = output_width / m->h_factor[c];
-        size_t yc = y / m->v_factor[c];
-        for (int dy = 0; dy < line_groups; ++dy) {
-          size_t ymid = yc + dy;
-          const float* JPEGLI_RESTRICT row_mid = raw_out->Row(ymid);
-          if (cinfo->do_fancy_upsampling && m->v_factor[c] == 2) {
-            const float* JPEGLI_RESTRICT row_top =
-                ymid == 0 ? row_mid : raw_out->Row(ymid - 1);
-            const float* JPEGLI_RESTRICT row_bot = ymid + 1 == m->raw_height_[c]
-                                                       ? row_mid
-                                                       : raw_out->Row(ymid + 1);
-            Upsample2Vertical(row_top, row_mid, row_bot,
-                              render_out->Row(2 * dy),
-                              render_out->Row(2 * dy + 1), downsampled_width);
-          } else {
-            for (int yix = 0; yix < m->v_factor[c]; ++yix) {
-              memcpy(render_out->Row(m->v_factor[c] * dy + yix), row_mid,
-                     downsampled_width * sizeof(float));
+      {
+        DecodeStageProfileTimer profile_timer(
+            m->decode_stage_profile, JPEGLI_DECODE_STAGE_CHROMA_UPSAMPLING);
+        for (int c = 0; c < cinfo->num_components; ++c) {
+          RowBuffer<float>* raw_out = &m->raw_output_[c];
+          RowBuffer<float>* render_out = &m->render_output_[c];
+          int line_groups = vfactor / m->v_factor[c];
+          int downsampled_width = output_width / m->h_factor[c];
+          size_t yc = y / m->v_factor[c];
+          for (int dy = 0; dy < line_groups; ++dy) {
+            size_t ymid = yc + dy;
+            const float* JPEGLI_RESTRICT row_mid = raw_out->Row(ymid);
+            if (cinfo->do_fancy_upsampling && m->v_factor[c] == 2) {
+              const float* JPEGLI_RESTRICT row_top =
+                  ymid == 0 ? row_mid : raw_out->Row(ymid - 1);
+              const float* JPEGLI_RESTRICT row_bot =
+                  ymid + 1 == m->raw_height_[c] ? row_mid
+                                                : raw_out->Row(ymid + 1);
+              Upsample2Vertical(row_top, row_mid, row_bot,
+                                render_out->Row(2 * dy),
+                                render_out->Row(2 * dy + 1), downsampled_width);
+            } else {
+              for (int yix = 0; yix < m->v_factor[c]; ++yix) {
+                memcpy(render_out->Row(m->v_factor[c] * dy + yix), row_mid,
+                       downsampled_width * sizeof(float));
+              }
             }
-          }
-          if (m->h_factor[c] > 1) {
-            for (int yix = 0; yix < m->v_factor[c]; ++yix) {
-              int row_ix = m->v_factor[c] * dy + yix;
-              float* JPEGLI_RESTRICT row = render_out->Row(row_ix);
-              float* JPEGLI_RESTRICT tmp =
-                  m->upsample_scratch_ + HWY_ALIGNMENT / sizeof(float);
-              if (cinfo->do_fancy_upsampling && m->h_factor[c] == 2) {
-                Upsample2Horizontal(row, tmp, output_width);
-              } else {
-                // TODO(szabadka) SIMDify this.
-                for (size_t x = 0; x < output_width; ++x) {
-                  tmp[x] = row[x / m->h_factor[c]];
+            if (m->h_factor[c] > 1) {
+              for (int yix = 0; yix < m->v_factor[c]; ++yix) {
+                int row_ix = m->v_factor[c] * dy + yix;
+                float* JPEGLI_RESTRICT row = render_out->Row(row_ix);
+                float* JPEGLI_RESTRICT tmp =
+                    m->upsample_scratch_ + HWY_ALIGNMENT / sizeof(float);
+                if (cinfo->do_fancy_upsampling && m->h_factor[c] == 2) {
+                  Upsample2Horizontal(row, tmp, output_width);
+                } else {
+                  // TODO(szabadka) SIMDify this.
+                  for (size_t x = 0; x < output_width; ++x) {
+                    tmp[x] = row[x / m->h_factor[c]];
+                  }
+                  memcpy(row, tmp, output_width * sizeof(tmp[0]));
                 }
-                memcpy(row, tmp, output_width * sizeof(tmp[0]));
               }
             }
           }
@@ -743,12 +753,20 @@ void ProcessOutput(j_decompress_ptr cinfo, size_t* num_output_rows,
         for (int c = 0; c < num_all_components; ++c) {
           rows[c] = m->render_output_[c].Row(yix);
         }
-        (*m->color_transform)(rows, output_width);
-        for (int c = 0; c < cinfo->out_color_components; ++c) {
-          // Undo the centering of the sample values around zero.
-          DecenterRow(rows[c], output_width);
+        {
+          DecodeStageProfileTimer profile_timer(
+              m->decode_stage_profile,
+              JPEGLI_DECODE_STAGE_COLOR_CONVERSION_AND_LEVEL_SHIFT);
+          (*m->color_transform)(rows, output_width);
+          for (int c = 0; c < cinfo->out_color_components; ++c) {
+            // Undo the centering of the sample values around zero.
+            DecenterRow(rows[c], output_width);
+          }
         }
         if (scanlines) {
+          DecodeStageProfileTimer profile_timer(
+              m->decode_stage_profile,
+              JPEGLI_DECODE_STAGE_OUTPUT_SAMPLE_CONVERSION_AND_WRITE);
           uint8_t* output = scanlines[*num_output_rows];
           WriteToOutput(cinfo, rows, m->xoffset_, cinfo->output_width,
                         cinfo->out_color_components, output);

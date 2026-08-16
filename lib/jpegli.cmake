@@ -85,9 +85,14 @@ configure_file(
   ../third_party/libjpeg-turbo/jmorecfg.h include/jpegli/jmorecfg.h COPYONLY)
 configure_file(
   jpegli/pipeline.h include/jpegli/jpegli_pipeline.h COPYONLY)
+configure_file(
+  jpegli/decode_stage_profile.h
+  include/jpegli/jpegli_decode_stage_profile.h COPYONLY)
 
 add_library(jpegli-static STATIC EXCLUDE_FROM_ALL "${JPEGLI_INTERNAL_JPEGLI_SOURCES}")
 target_compile_options(jpegli-static PRIVATE "${JPEGLI_INTERNAL_FLAGS}")
+target_compile_definitions(jpegli-static PRIVATE
+  JPEGLI_ENABLE_DECODE_STAGE_PROFILING=$<BOOL:${JPEGLI_ENABLE_DECODE_STAGE_PROFILING}>)
 target_compile_options(jpegli-static PUBLIC ${JPEGLI_COVERAGE_FLAGS})
 set_property(TARGET jpegli-static PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_include_directories(jpegli-static PRIVATE

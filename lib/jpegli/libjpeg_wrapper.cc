@@ -13,9 +13,15 @@
 
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/decode.h"
+#include "lib/jpegli/decode_stage_profile.h"
 #include "lib/jpegli/encode.h"
 #include "lib/jpegli/pipeline.h"
 #include "lib/jpegli/pipeline_internal.h"
+
+namespace jpegli {
+bool EnableDecodeStageProfiling(j_decompress_ptr cinfo,
+                                jpegli_decode_stage_profile* profile);
+}  // namespace jpegli
 
 struct jpeg_error_mgr *jpeg_std_error(struct jpeg_error_mgr *err) {
   return jpegli_std_error(err);
@@ -132,6 +138,11 @@ void jpeg_abort_decompress(j_decompress_ptr cinfo) {
 
 void jpeg_destroy_decompress(j_decompress_ptr cinfo) {
   jpegli_destroy_decompress(cinfo);
+}
+
+int jpegli_enable_decode_stage_profiling(
+    j_decompress_ptr cinfo, jpegli_decode_stage_profile* profile) {
+  return jpegli::EnableDecodeStageProfiling(cinfo, profile) ? 1 : 0;
 }
 
 void jpeg_CreateCompress(j_compress_ptr cinfo, int version, size_t structsize) {

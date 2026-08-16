@@ -22,6 +22,7 @@
 #include "lib/jpegli/decode_internal.h"
 #include "lib/jpegli/decode_marker.h"
 #include "lib/jpegli/decode_scan.h"
+#include "lib/jpegli/decode_stage_profile_internal.h"
 #include "lib/jpegli/error.h"
 #include "lib/jpegli/huffman.h"
 #include "lib/jpegli/memory_manager.h"
@@ -212,6 +213,8 @@ void BuildHuffmanLookupTable(j_decompress_ptr cinfo, JHUFF_TBL* table,
 
 void PrepareForScan(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
+  DecodeStageProfileTimer profile_timer(
+      m->decode_stage_profile, JPEGLI_DECODE_STAGE_SCAN_PREPARATION);
   for (int i = 0; i < cinfo->comps_in_scan; ++i) {
     int comp_idx = cinfo->cur_comp_info[i]->component_index;
     int* prev_coef_bits = cinfo->coef_bits[comp_idx + cinfo->num_components];
@@ -319,8 +322,14 @@ int ConsumeInput(j_decompress_ptr cinfo) {
     }
     size_t pos = 0;
     if (cinfo->global_state == kDecProcessScan) {
-      status = ProcessScan(cinfo, data, len, &pos, &m->codestream_bits_ahead_);
+      DecodeStageProfileTimer profile_timer(
+          m->decode_stage_profile,
+          JPEGLI_DECODE_STAGE_ENTROPY_AND_COEFFICIENT_RECONSTRUCTION);
+      status =
+          ProcessScan(cinfo, data, len, &pos, &m->codestream_bits_ahead_);
     } else {
+      DecodeStageProfileTimer profile_timer(
+          m->decode_stage_profile, JPEGLI_DECODE_STAGE_MARKER_PARSING);
       status = ProcessMarkers(cinfo, data, len, &pos);
     }
     if (m->input_buffer_.empty()) {
@@ -488,6 +497,8 @@ boolean PrepareQuantizedOutput(j_decompress_ptr cinfo) {
 
 void AllocateCoefficientBuffer(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
+  DecodeStageProfileTimer profile_timer(
+      m->decode_stage_profile, JPEGLI_DECODE_STAGE_BUFFER_ALLOCATION);
   j_common_ptr comptr = reinterpret_cast<j_common_ptr>(cinfo);
   jvirt_barray_ptr* coef_arrays = jpegli::Allocate<jvirt_barray_ptr>(
       cinfo, cinfo->num_components, JPOOL_IMAGE);
@@ -505,6 +516,8 @@ void AllocateCoefficientBuffer(j_decompress_ptr cinfo) {
 
 void AllocateOutputBuffers(j_decompress_ptr cinfo) {
   jpeg_decomp_master* m = cinfo->master;
+  DecodeStageProfileTimer profile_timer(
+      m->decode_stage_profile, JPEGLI_DECODE_STAGE_BUFFER_ALLOCATION);
   size_t iMCU_width =
       static_cast<size_t>(cinfo->max_h_samp_factor) * m->min_scaled_dct_size;
   size_t output_stride = m->iMCU_cols_ * iMCU_width;
@@ -576,6 +589,8 @@ void jpegli_CreateDecompress(j_decompress_ptr cinfo, int version,
   cinfo->rec_outbuf_height = 1;         // output works with any buffer height
   cinfo->master = new jpeg_decomp_master;
   jpeg_decomp_master* m = cinfo->master;
+  m->decode_stage_profile = nullptr;
+  m->decode_stage_profile_start_ns = 0;
   for (auto& app_marker_parser : m->app_marker_parsers) {
     app_marker_parser = nullptr;
   }
@@ -648,6 +663,7 @@ int jpegli_read_header(j_decompress_ptr cinfo, boolean require_image) {
   if (cinfo->src == nullptr) {
     JPEGLI_ERROR("Missing source.");
   }
+  jpegli::DecodeStageProfileStart(cinfo->master);
   for (;;) {
     int retcode = jpegli_consume_input(cinfo);
     if (retcode == JPEG_SUSPENDED) {
@@ -1018,6 +1034,7 @@ boolean jpegli_finish_decompress(j_decompress_ptr cinfo) {
     }
   }
   (*cinfo->src->term_source)(cinfo);
+  jpegli::DecodeStageProfileFinish(cinfo->master);
   jpegli_abort_decompress(cinfo);
   return TRUE;
 }
