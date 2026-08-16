@@ -68,7 +68,10 @@ from 9.571 to 4.476 ms for baseline JPEG and from 18.982 to 14.065 ms for
 progressive JPEG.  A conservative 480,000-pixel policy is faster at both p50
 and p95 across the tested quality, sampling, and scan configurations.  The
 direct path uses 25.02 MiB median retained memory for 4:2:0 and is byte-for-byte
-identical to CPU JPEGli.  Across a separate 1,500-window campaign, it consumes
+identical to CPU JPEGli.  That exactness retains JPEGli's perceptual advantage
+at high quality: at Q95 4:4:4 it scores 89.389 SSIMULACRA2 and 1.054
+Butteraugli, versus 88.524/1.147 for TurboJPEG.  Across a separate
+1,500-window campaign, direct Metal consumes
 53.8\% less \emph{process-attributed} energy than CPU JPEGli and is effectively
 tied with TurboJPEG overall (0.3\% less), while using 27.1\% less than
 TurboJPEG on large baseline images.  The macOS counter is not whole-device
@@ -102,6 +105,15 @@ floating-point reconstruction and expectation-based adaptive dequantization,
 rather than simply reproducing a conventional integer reconstruction
 pipeline~\cite{jpegli}.  A GPU implementation must match that behavior exactly
 if it is to remain behind an existing libjpeg-compatible API.
+
+The practical rationale is also perceptual.  Replacing CPU JPEGli with a
+faster conventional decoder changes pixels reconstructed from the same JPEGli
+bitstream.  Our quality study finds that JPEGli generally improves
+SSIMULACRA2 at Q75 and above and leads both SSIMULACRA2 and Butteraugli for
+high-quality 4:4:4.  Metal acceleration can therefore close the performance
+gap while retaining a reconstruction behavior that users may prefer; an
+approximate GPU kernel would give up part of the reason to accelerate JPEGli
+in the first place.
 
 This paper makes four contributions:
 
@@ -666,10 +678,39 @@ Table~\ref{tab:quality} confirms that decoder choice can change perceptual
 scores even when the compressed bytes are fixed.  There is no universal
 low-quality winner: TurboJPEG leads several Q50 and Butteraugli entries.
 JPEGli generally leads SSIMULACRA2 at Q75 and above, and leads both metrics for
-high-quality 4:4:4.  GPU offload introduces no new quality tradeoff because
-the output pixels are identical to CPU JPEGli.
+high-quality 4:4:4.  At Q90 4:2:0, JPEGli raises SSIMULACRA2 from TurboJPEG's
+81.295 to 81.996 and from ImageIO's 79.726, although TurboJPEG has a slightly
+lower Butteraugli distance (2.650 versus 2.671).  At Q90 4:4:4, JPEGli leads
+both comparisons at 84.687/1.643 versus 84.015/1.654 for TurboJPEG and
+83.919/1.679 for ImageIO.  The Q95 4:4:4 separation grows to 89.389/1.054,
+versus 88.524/1.147 and 88.316/1.189.
+
+These findings supply an additional rationale for the project.  CPU JPEGli
+does not beat TurboJPEG on latency, so a performance-only application could
+simply switch decoders.  The Metal backend instead preserves JPEGli's distinct
+high-quality reconstruction while recovering or exceeding incumbent speed on
+substantial images.  GPU offload introduces no new perceptual tradeoff because
+every accelerated pixel is identical to CPU JPEGli; exactness is thus a
+product requirement, not merely a convenient test oracle.
 
 \section{Discussion}
+
+\subsection{Why accelerate JPEGli?}
+
+The original baseline 4:2:0 comparison measured 299.2 MP/s for CPU JPEGli and
+601.6 MP/s for TurboJPEG.  Absent a quality difference, a twofold CPU
+throughput gap would be a strong argument to use the incumbent rather than add
+a GPU backend.  Table~\ref{tab:quality} changes that tradeoff: at Q90 and Q95,
+especially 4:4:4, JPEGli's adaptive reconstruction improves the measured
+perceptual result from the same compressed file.  Direct Metal reaches 631.2
+MP/s on the Q90 baseline 4:2:0 CLIC pass while remaining byte-identical to
+JPEGli, combining the desired reconstruction with incumbent-class speed.
+
+This is not a claim that JPEGli wins every metric or quality level.  The Q50
+results and Q90 4:2:0 Butteraugli result show why the paper reports both
+metrics rather than selecting only favorable cells.  It is a narrower systems
+claim: when an application chooses JPEGli's reconstruction, it need not pay
+the full original CPU latency on a sufficiently large Apple-silicon image.
 
 \subsection{What should run on the GPU?}
 
@@ -769,7 +810,8 @@ and compare distributions without relying on rounded values in this paper.
 
 An Apple GPU can materially improve one-image JPEGli decode without taking
 over the format state machine.  On M4 Max, direct Metal reconstruction halves
-warm baseline 4:2:0 latency, preserves exact pixels, and reduces
+warm baseline 4:2:0 latency, preserves the exact pixels responsible for
+JPEGli's measured high-quality perceptual results, and reduces
 process-attributed energy relative to CPU JPEGli in every measured case.  The
 gain falls for progressive scans because the CPU front end dominates, and GPU
 overhead leaves TurboJPEG ahead on most small images.  A 480,000-pixel AUTO
