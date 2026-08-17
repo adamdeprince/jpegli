@@ -3,9 +3,9 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_ballot : require
 
-// One AMD wave64 workgroup owns one JPEG block. This lets the shader classify
-// all coefficients in parallel and use subgroup prefix operations to place
-// variable-length zero-run tokens without a second dispatch.
+// One AMD wave64 workgroup owns one JPEG block. The latency path dispatches
+// once per scan. Throughput mode dispatches once per component and reuses the
+// coefficient load across every AC scan for that component.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer CoefficientBuffer {
@@ -14,6 +14,12 @@ layout(set = 0, binding = 0, std430) readonly buffer CoefficientBuffer {
 
 layout(set = 0, binding = 1, std430) writeonly buffer DescriptorBuffer {
   uint descriptor_words[];
+};
+
+// Eight words per scan: block count, Ss, Se, Al, descriptor stride, context,
+// initial/refinement mode, and descriptor output offset.
+layout(set = 0, binding = 2, std430) readonly buffer ScanParameterBuffer {
+  uint scan_parameter_words[];
 };
 
 layout(push_constant) uniform PushConstants {
@@ -27,6 +33,8 @@ layout(push_constant) uniform PushConstants {
   uint dispatch_width;
   uint mode;
   uint output_word_offset;
+  uint scan_parameter_offset;
+  uint scan_parameter_count;
 } pc;
 
 shared uint active_positions[64];
@@ -37,25 +45,22 @@ int LoadCoefficient(uint block, uint coefficient) {
   return bitfieldExtract(int(packed), int((half_index & 1u) * 16u), 16);
 }
 
-void main() {
-  uint block = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.dispatch_width;
-  if (block >= pc.num_blocks) return;
-
-  uint lane = gl_LocalInvocationID.x;
-  bool in_band = lane >= pc.spectral_start && lane <= pc.spectral_end;
-  int coefficient = LoadCoefficient(block, lane);
-
-  if (pc.mode == 1u) {
+void EmitScanDescriptor(uint block, uint lane, int coefficient,
+                        uint spectral_start, uint spectral_end,
+                        uint successive_low, uint output_stride_words,
+                        uint context, uint mode, uint output_word_offset) {
+  bool in_band = lane >= spectral_start && lane <= spectral_end;
+  uint output_base = output_word_offset + block * output_stride_words;
+  if (mode == 1u) {
     int sign_mask = coefficient >> 31;
     int magnitude = (coefficient + sign_mask) ^ sign_mask;
-    magnitude >>= pc.successive_low;
+    magnitude >>= successive_low;
     bool event = in_band && magnitude != 0;
     bool newly_significant = event && magnitude == 1;
     uvec4 event_mask = subgroupBallot(event);
     uint event_rank = subgroupBallotExclusiveBitCount(event_mask);
     uint event_count = subgroupBallotBitCount(event_mask);
     uint new_count = subgroupBallotBitCount(subgroupBallot(newly_significant));
-    uint output_base = pc.output_word_offset + block * pc.output_stride_words;
     if (event) {
       bool existing = magnitude > 1;
       uint packed_event = lane | (uint(existing) << 8u) |
@@ -67,6 +72,8 @@ void main() {
       descriptor_words[output_base] = event_count;
       descriptor_words[output_base + 1u] = new_count;
     }
+    // Throughput mode can immediately reuse shared scratch for the next scan.
+    barrier();
     return;
   }
 
@@ -74,13 +81,12 @@ void main() {
   int encoded_bits = 0;
   if (magnitude < 0) {
     magnitude = -magnitude;
-    magnitude >>= pc.successive_low;
+    magnitude >>= successive_low;
     encoded_bits = ~magnitude;
   } else {
-    magnitude >>= pc.successive_low;
+    magnitude >>= successive_low;
     encoded_bits = magnitude;
   }
-
   bool significant = in_band && magnitude != 0;
   bool future_nonzero = in_band && coefficient != 0 && magnitude == 0;
   uvec4 active_mask = subgroupBallot(significant);
@@ -88,47 +94,69 @@ void main() {
   uint active_rank = subgroupBallotExclusiveBitCount(active_mask);
   uint active_count = subgroupBallotBitCount(active_mask);
   uint future_count = subgroupBallotBitCount(future_mask);
-
   if (significant) active_positions[active_rank] = lane;
   barrier();
 
-  uint zero_run_tokens = 0;
-  uint zero_run = 0;
+  uint zero_run_tokens = 0u;
+  uint zero_run = 0u;
   if (significant) {
     uint previous = active_rank == 0u
-                        ? pc.spectral_start - 1u
+                        ? spectral_start - 1u
                         : active_positions[active_rank - 1u];
     zero_run = lane - previous - 1u;
     zero_run_tokens = zero_run / 16u;
   }
-
   uint zero_run_prefix = subgroupExclusiveAdd(zero_run_tokens);
   uint total_zero_run_tokens = subgroupAdd(zero_run_tokens);
-  uint output_base = pc.output_word_offset + block * pc.output_stride_words;
-
   if (significant) {
     uint output_index = active_rank + zero_run_prefix;
-    for (uint i = 0; i < zero_run_tokens; ++i) {
+    for (uint i = 0u; i < zero_run_tokens; ++i) {
       descriptor_words[output_base + 2u + output_index + i] =
-          pc.context | (0xf0u << 8u);
+          context | (0xf0u << 8u);
     }
-
     uint residual_run = zero_run - 16u * zero_run_tokens;
     uint nbits = uint(findMSB(uint(magnitude)) + 1);
     uint bits_mask = (1u << nbits) - 1u;
     uint symbol = (residual_run << 4u) + nbits;
     descriptor_words[output_base + 2u + output_index + zero_run_tokens] =
-        pc.context | (symbol << 8u) |
+        context | (symbol << 8u) |
         ((uint(encoded_bits) & bits_mask) << 16u);
   }
-
   if (lane == 0u) {
     uint token_count = active_count + total_zero_run_tokens;
     bool trailing_eob = active_count == 0u ||
-                        active_positions[active_count - 1u] < pc.spectral_end;
+                        active_positions[active_count - 1u] < spectral_end;
     descriptor_words[output_base] = token_count;
     descriptor_words[output_base + 1u] =
         active_count | (future_count << 8u) |
         (uint(trailing_eob) << 16u);
   }
+  // Keep shared active_positions live until every lane has finished this scan.
+  barrier();
+}
+
+void main() {
+  uint block = gl_WorkGroupID.x + gl_WorkGroupID.y * pc.dispatch_width;
+  if (block >= pc.num_blocks) return;
+  uint lane = gl_LocalInvocationID.x;
+  int coefficient = LoadCoefficient(block, lane);
+  if (pc.mode == 4u) {
+    for (uint scan = 0u; scan < pc.scan_parameter_count; ++scan) {
+      uint parameter = (pc.scan_parameter_offset + scan) * 8u;
+      EmitScanDescriptor(
+          block, lane, coefficient,
+          scan_parameter_words[parameter + 1u],
+          scan_parameter_words[parameter + 2u],
+          scan_parameter_words[parameter + 3u],
+          scan_parameter_words[parameter + 4u],
+          scan_parameter_words[parameter + 5u],
+          scan_parameter_words[parameter + 6u],
+          scan_parameter_words[parameter + 7u]);
+    }
+    return;
+  }
+  EmitScanDescriptor(block, lane, coefficient, pc.spectral_start,
+                     pc.spectral_end, pc.successive_low,
+                     pc.output_stride_words, pc.context, pc.mode,
+                     pc.output_word_offset);
 }
