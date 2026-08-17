@@ -68,9 +68,10 @@ from 9.571 to 4.476 ms for baseline JPEG and from 18.982 to 14.065 ms for
 progressive JPEG.  A conservative 480,000-pixel policy is faster at both p50
 and p95 across the tested quality, sampling, and scan configurations.  The
 direct path uses 25.02 MiB median retained memory for 4:2:0 and is byte-for-byte
-identical to CPU JPEGli.  That exactness retains JPEGli's perceptual advantage
-at high quality: at Q95 4:4:4 it scores 89.389 SSIMULACRA2 and 1.054
-Butteraugli, versus 88.524/1.147 for TurboJPEG.  Across a separate
+identical to CPU JPEGli.  That exactness retains JPEGli's distinct perceptual
+behavior: in a four-metric Q25--100 sweep, Q100 JPEGli lowers all four
+aggregate distortions relative to TurboJPEG at 4:4:4, 4:2:2, and 4:2:0,
+although DISTS favors both incumbents through Q95.  Across a separate
 1,500-window campaign, direct Metal consumes
 53.8\% less \emph{process-attributed} energy than CPU JPEGli and is effectively
 tied with TurboJPEG overall (0.3\% less), while using 27.1\% less than
@@ -108,12 +109,14 @@ if it is to remain behind an existing libjpeg-compatible API.
 
 The practical rationale is also perceptual.  Replacing CPU JPEGli with a
 faster conventional decoder changes pixels reconstructed from the same JPEGli
-bitstream.  Our quality study finds that JPEGli generally improves
-SSIMULACRA2 at Q75 and above and leads both SSIMULACRA2 and Butteraugli for
-high-quality 4:4:4.  Metal acceleration can therefore close the performance
-gap while retaining a reconstruction behavior that users may prefer; an
-approximate GPU kernel would give up part of the reason to accelerate JPEGli
-in the first place.
+bitstream.  Our quality study finds that JPEGli's reconstruction becomes
+increasingly favorable at high quality, but also exposes meaningful metric
+disagreement.  At Q95, SSIMULACRA2, Butteraugli, and ColorVideoVDP generally
+favor JPEGli while DISTS favors the incumbents; at Q100 JPEGli leads
+TurboJPEG on all four aggregate metrics in every sampling mode.  Metal
+acceleration can therefore close the performance gap while retaining the
+selected reconstruction behavior; an approximate GPU kernel would change the
+very output being evaluated.
 
 This paper makes four contributions:
 
@@ -293,10 +296,34 @@ CPU JPEGli.  Incumbent outputs were checked for successful decode, dimensions,
 and opaque RGBA, but not byte equality: JPEGli's expectation-based
 dequantization intentionally reconstructs different pixels.
 
-Perceptual measurements compare each decoded JPEG with its original source
-using SSIMULACRA2 (higher is better) and Butteraugli (lower is
-better)~\cite{ssimulacra2,butteraugli}.  Since every Metal result equals CPU
-JPEGli, it necessarily inherits the same perceptual score; these metrics
+The quality corpus uses all 30 CLIC sources at encoder qualities 25 through
+100 in steps of five and at 4:4:4, 4:2:2, and 4:2:0 sampling.  The baseline
+scan layout is sufficient here because scan order does not change the final
+quantized coefficient set.  Each JPEG is decoded by CPU JPEGli, TurboJPEG,
+and ImageIO; ImageIO is drawn explicitly into an sRGB context.  The exact RGB
+samples used by the in-process metrics are serialized losslessly for the two
+external metrics.
+
+Four full-reference metrics compare each decoded JPEG with its original:
+SSIMULACRA2 (higher), Butteraugli (lower), ColorVideoVDP JOD (higher), and
+DISTS (lower)~\cite{ssimulacra2,butteraugli,colorvideovdp,dists}.
+ColorVideoVDP 0.5.6 uses its \code{standard\_4k} SDR display model.  DISTS
+0.1 evaluates native-resolution sRGB tensors without resizing, using its
+published weights and ImageNet VGG16 features.  Both learned metrics run in
+inference mode through PyTorch/MPS; PyTorch is not part of any decoder path.
+Package, model, display-configuration, and input hashes accompany the raw
+results.
+
+To put metrics with opposite directions on one plot, we convert each score to
+distortion: $100-S$ for SSIMULACRA2, $10-J$ for ColorVideoVDP, and the raw
+Butteraugli or DISTS distance.  We first average each decoder's distortion
+over the 30 paired images, then divide incumbent distortion by JPEGli
+distortion.  Thus values above one consistently favor JPEGli, and a base-2
+logarithmic ordinate gives reciprocal ratios equal visual distance.  Averaging
+before division remains defined when an individual ColorVideoVDP observation
+reaches its 10-JOD ceiling.  Off-scale ratios are labeled rather than silently clipped.
+Per-image win counts accompany the aggregate curves.  Since every Metal result
+equals CPU JPEGli, it necessarily inherits the same four scores; these metrics
 characterize decoder behavior, not a GPU approximation.
 
 \subsection{Energy protocol}
@@ -653,37 +680,52 @@ decode error, dimensional mismatch, alpha error, or unavailable energy sample.
 
 \begin{table}[t]
   \centering
-  \caption{Perceptual scores for JPEGli-encoded files.  Each cell is
-  SSIMULACRA2 / Butteraugli; higher/lower is better.  Metal equals CPU JPEGli.}
+  \caption{Number of aggregate perceptual metrics favoring JPEGli out of
+  SSIMULACRA2, Butteraugli, ColorVideoVDP, and DISTS.}
   \label{tab:quality}
   \scriptsize
-  \resizebox{\columnwidth}{!}{%
-  \begin{tabular}{@{}rrlll@{}}
+  \begin{tabular}{@{}llccc@{}}
     \toprule
-    Q & Sampling & CPU JPEGli / Metal & TurboJPEG & ImageIO \\
+    Incumbent & Sampling & Q90 & Q95 & Q100 \\
     \midrule
-    50 & 4:2:0 & 60.171 / 4.692 & 60.631 / 4.670 & 59.895 / 5.308 \\
-    50 & 4:4:4 & 63.787 / 4.109 & 64.520 / 3.979 & 64.408 / 3.985 \\
-    75 & 4:2:0 & 71.984 / 3.508 & 71.774 / 3.478 & 70.788 / 4.463 \\
-    75 & 4:4:4 & 74.849 / 2.843 & 74.690 / 2.731 & 74.706 / 2.730 \\
-    90 & 4:2:0 & 81.996 / 2.671 & 81.295 / 2.650 & 79.726 / 3.813 \\
-    90 & 4:4:4 & 84.687 / 1.643 & 84.015 / 1.654 & 83.919 / 1.679 \\
-    95 & 4:2:0 & 86.673 / 2.318 & 86.027 / 2.343 & 83.923 / 3.603 \\
-    95 & 4:4:4 & 89.389 / 1.054 & 88.524 / 1.147 & 88.316 / 1.189 \\
+    TurboJPEG & 4:4:4 & 3/4 & 3/4 & 4/4 \\
+              & 4:2:2 & 3/4 & 3/4 & 4/4 \\
+              & 4:2:0 & 2/4 & 3/4 & 4/4 \\
+    ImageIO   & 4:4:4 & 3/4 & 3/4 & 4/4 \\
+              & 4:2:2 & 3/4 & 3/4 & 4/4 \\
+              & 4:2:0 & 2/4 & 3/4 & 3/4 \\
     \bottomrule
-  \end{tabular}}
+  \end{tabular}
 \end{table}
 
-Table~\ref{tab:quality} confirms that decoder choice can change perceptual
-scores even when the compressed bytes are fixed.  There is no universal
-low-quality winner: TurboJPEG leads several Q50 and Butteraugli entries.
-JPEGli generally leads SSIMULACRA2 at Q75 and above, and leads both metrics for
-high-quality 4:4:4.  At Q90 4:2:0, JPEGli raises SSIMULACRA2 from TurboJPEG's
-81.295 to 81.996 and from ImageIO's 79.726, although TurboJPEG has a slightly
-lower Butteraugli distance (2.650 versus 2.671).  At Q90 4:4:4, JPEGli leads
-both comparisons at 84.687/1.643 versus 84.015/1.654 for TurboJPEG and
-83.919/1.679 for ImageIO.  The Q95 4:4:4 separation grows to 89.389/1.054,
-versus 88.524/1.147 and 88.316/1.189.
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.49\textwidth]{../perceptual_quality/quality-ratio-turbojpeg-444.pdf}
+  \includegraphics[width=0.49\textwidth]{../perceptual_quality/quality-ratio-apple_imageio-444.pdf}\\
+  \includegraphics[width=0.49\textwidth]{../perceptual_quality/quality-ratio-turbojpeg-422.pdf}
+  \includegraphics[width=0.49\textwidth]{../perceptual_quality/quality-ratio-apple_imageio-422.pdf}\\
+  \includegraphics[width=0.49\textwidth]{../perceptual_quality/quality-ratio-turbojpeg-420.pdf}
+  \includegraphics[width=0.49\textwidth]{../perceptual_quality/quality-ratio-apple_imageio-420.pdf}
+  \caption{Incumbent mean distortion divided by JPEGli mean distortion over
+  30 paired images.  Values above one favor JPEGli.  The base-2 logarithmic
+  ordinate makes reciprocal ratios symmetric; labeled arrows are off-scale.}
+  \label{fig:quality-ratios}
+\end{figure*}
+
+Table~\ref{tab:quality} and Figure~\ref{fig:quality-ratios} confirm that
+decoder choice changes perceptual predictions even when the compressed bytes
+are fixed, but they do not produce a universal ranking.  At Q90 and Q95,
+JPEGli leads three of four metrics for 4:4:4 and 4:2:2; DISTS favors both
+incumbents through Q95 in every sampling mode.  At Q100, JPEGli leads
+TurboJPEG on all four aggregate metrics for all three sampling modes and
+ImageIO on all four for 4:4:4 and 4:2:2.  ImageIO retains a Q100 4:2:0 DISTS
+advantage.
+
+Aggregate wins are not per-image guarantees.  Strict all-four Q100 wins are
+22/30, 13/30, and 6/30 images against TurboJPEG, and 23/30, 17/30, and 1/30
+against ImageIO, for 4:4:4, 4:2:2, and 4:2:0 respectively.  The complete raw
+corpus, component mean distortions, and per-image win counts accompany the
+paper.
 
 These findings supply an additional rationale for the project.  CPU JPEGli
 does not beat TurboJPEG on latency, so a performance-only application could
@@ -700,17 +742,18 @@ product requirement, not merely a convenient test oracle.
 The original baseline 4:2:0 comparison measured 299.2 MP/s for CPU JPEGli and
 601.6 MP/s for TurboJPEG.  Absent a quality difference, a twofold CPU
 throughput gap would be a strong argument to use the incumbent rather than add
-a GPU backend.  Table~\ref{tab:quality} changes that tradeoff: at Q90 and Q95,
-especially 4:4:4, JPEGli's adaptive reconstruction improves the measured
-perceptual result from the same compressed file.  Direct Metal reaches 631.2
-MP/s on the Q90 baseline 4:2:0 CLIC pass while remaining byte-identical to
-JPEGli, combining the desired reconstruction with incumbent-class speed.
+a GPU backend.  Table~\ref{tab:quality} makes the tradeoff conditional: three
+metrics generally favor JPEGli by Q95, DISTS does not, and all four favor
+JPEGli over TurboJPEG only at Q100.  Direct Metal reaches 631.2 MP/s on the
+Q90 baseline 4:2:0 CLIC pass while remaining byte-identical to JPEGli,
+combining the selected reconstruction with incumbent-class speed.
 
-This is not a claim that JPEGli wins every metric or quality level.  The Q50
-results and Q90 4:2:0 Butteraugli result show why the paper reports both
-metrics rather than selecting only favorable cells.  It is a narrower systems
-claim: when an application chooses JPEGli's reconstruction, it need not pay
-the full original CPU latency on a sufficiently large Apple-silicon image.
+This is not a claim that JPEGli wins every metric, image, or quality level.
+The DISTS curve and per-image counts are precisely why the paper reports four
+metrics and raw outcomes rather than selecting favorable cells.  It is a
+narrower systems claim: when an application chooses JPEGli's reconstruction,
+it need not pay the full original CPU latency on a sufficiently large
+Apple-silicon image.
 
 \subsection{What should run on the GPU?}
 

@@ -1,0 +1,9 @@
+# External full-reference metrics used by score_external_quality_metrics.py.
+# Keep these pinned: learned-model and display-model updates change scores.
+cvvdp==0.5.6
+DISTS-pytorch==0.1
+matplotlib==3.11.1
+numpy==2.5.2
+Pillow==12.3.0
+torch==2.13.0
+torchvision==0.28.0

@@ -1,0 +1,102 @@
+{
+  "aggregation": "ratio of arithmetic-mean distortion over 30 paired images",
+  "axis": "base-2 logarithmic with reciprocal bounds",
+  "comparisons": {
+    "apple_imageio": "Apple ImageIO",
+    "turbojpeg": "TurboJPEG"
+  },
+  "images_per_setting": 30,
+  "inputs": [
+    {
+      "path": "/private/tmp/jpegli-quality-q25-100.Ulmx3d/444-low/four-metrics.csv",
+      "sha256": "b89186b837eb597441bf878b1c52f58d34e50ec0c7691dfd00491d7d12d2fa78"
+    },
+    {
+      "path": "/private/tmp/jpegli-quality-q25-100.Ulmx3d/444-high/four-metrics.csv",
+      "sha256": "f0b8a1cebe92c6256ab272cc5211602f1081e9ce866d46f3e7f10adafebb57ef"
+    },
+    {
+      "path": "/private/tmp/jpegli-quality-q25-100.Ulmx3d/422-low/four-metrics.csv",
+      "sha256": "3919e97a9b9d735084ac464960db42f7f610bf8b87cf1cde7795302d837bb077"
+    },
+    {
+      "path": "/private/tmp/jpegli-quality-q25-100.Ulmx3d/422-high/four-metrics.csv",
+      "sha256": "1b5c7d96c67a623e55e537f35831ce52fda4a5dbd4d8ab102e809bc522cd5c10"
+    },
+    {
+      "path": "/private/tmp/jpegli-quality-q25-100.Ulmx3d/420-low/four-metrics.csv",
+      "sha256": "c04be4169ca31ff7dcc9d5c4f224ea416408f0f320dda117f130705fb21e98e7"
+    },
+    {
+      "path": "/private/tmp/jpegli-quality-q25-100.Ulmx3d/420-high/four-metrics.csv",
+      "sha256": "3cbc589b6c5077a7e70c5852639c3951f7659ed5c17cd4c06a678384a365dd82"
+    }
+  ],
+  "loss_transforms": {
+    "butteraugli": "score",
+    "cvvdp_jod": "10 - score",
+    "dists": "score",
+    "ssimulacra2": "100 - score"
+  },
+  "output_sha256": {
+    "four-metric-corpus.csv": "4ac605d62fc55870f496e5d4d85375d48eae22b410a7b78bd603145803143ffc",
+    "four-metric-summary.csv": "414b5a539130da0819c488af8cbff8207570905f44eb61e1380c63df1c3d303b",
+    "quality-loss-ratios.csv": "7ee459bceef14970c14ce9fac3456777d388eedc2d1161f0be3e24ea56edf7c8",
+    "quality-ratio-apple_imageio-420.pdf": "c74984cc2c761a2f16f8f0e59bbe72da96c148508bede52881bda76e7290e2bf",
+    "quality-ratio-apple_imageio-420.svg": "a27ea895a08a26ed3aa7d66d51a544e8a4e7604647bcad733f116cf94991ad56",
+    "quality-ratio-apple_imageio-422.pdf": "95bcf64a1197156085e6e43a0cdaff1ba0062207959e3dcea390d719cb378014",
+    "quality-ratio-apple_imageio-422.svg": "7b6c0e5472c570b9ac66ce8c1798ba00d2cb15d777134154018b1b365eda3ec6",
+    "quality-ratio-apple_imageio-444.pdf": "ceed8c8c033ad2ad545c3ff30f0c2e4b3b9dafe583a5542ee441c10e23faa858",
+    "quality-ratio-apple_imageio-444.svg": "d7fefd81124cad232cfd21bbd62857f55c77f08d8734a3322564666f8bb6db11",
+    "quality-ratio-turbojpeg-420.pdf": "9c741d070bb5d27dc55eae91a46e24d682814a04c165874382d96ea174966c89",
+    "quality-ratio-turbojpeg-420.svg": "b39056a230126d34ab3a0cde5f1ce8d0be48b022b3454639408932b81168eb39",
+    "quality-ratio-turbojpeg-422.pdf": "37f62305429ed2e8618073768be82c4b679c9679ea3deeca21ffa4f4cab0cf76",
+    "quality-ratio-turbojpeg-422.svg": "28ec6df3ab1e02dd7581270a064c6add9c02ff027f72ec5d932bf8d81fd97d34",
+    "quality-ratio-turbojpeg-444.pdf": "678a22870edc2f2f73f34cc4c643c9df53d7c891a63f2ce97ba127482c8bf378",
+    "quality-ratio-turbojpeg-444.svg": "1ef030c0740834639455b12a57a4301ff7d8d55e9483ace7de83f089272f1dd2",
+    "quality-win-counts.csv": "bfecd6281abc04284d8c5dbb16008cf8126b90866918b9eddc2fdb784e426a19"
+  },
+  "paper_plot_files": [
+    "quality-ratio-turbojpeg-444.pdf",
+    "quality-ratio-turbojpeg-422.pdf",
+    "quality-ratio-turbojpeg-420.pdf",
+    "quality-ratio-apple_imageio-444.pdf",
+    "quality-ratio-apple_imageio-422.pdf",
+    "quality-ratio-apple_imageio-420.pdf"
+  ],
+  "plot_script_sha256": "cc4db4b4120c1dbd70a2bc3e79fd311d836d89f74f2010af62e3bbd4b24d2600",
+  "plots": [
+    "quality-ratio-turbojpeg-444.svg",
+    "quality-ratio-turbojpeg-422.svg",
+    "quality-ratio-turbojpeg-420.svg",
+    "quality-ratio-apple_imageio-444.svg",
+    "quality-ratio-apple_imageio-422.svg",
+    "quality-ratio-apple_imageio-420.svg"
+  ],
+  "qualities": [
+    25,
+    30,
+    35,
+    40,
+    45,
+    50,
+    55,
+    60,
+    65,
+    70,
+    75,
+    80,
+    85,
+    90,
+    95,
+    100
+  ],
+  "ratio_direction": "above 1 means JPEGli has less predicted distortion",
+  "rows": 4320,
+  "subsampling": [
+    "444",
+    "422",
+    "420"
+  ],
+  "zero_loss_handling": "an incumbent/JPEGli distortion ratio is infinite when JPEGli reaches a metric's zero-distortion ceiling and the incumbent does not; the plot marks it at the upper boundary rather than applying an arbitrary epsilon"
+}
