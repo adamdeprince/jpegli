@@ -343,7 +343,7 @@ bool DecodeSuspended(const std::vector<uint8_t>& encoded,
 
 TEST(AppleMetalTest, ExactBaselineProgressiveSamplingQualityAndRestart) {
   if (!jpegli_apple_metal_is_available()) GTEST_SKIP();
-  for (int quality : {50, 95}) {
+  for (int quality : {50, 95, 100}) {
     for (const char* sampling : {"444", "440", "422", "420"}) {
       for (bool progressive : {false, true}) {
         std::vector<uint8_t> encoded;

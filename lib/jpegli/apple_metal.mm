@@ -219,9 +219,13 @@ inline void reconstruct_block(
       const float bias = active
           ? biases[(component * params.total_imcu_rows + imcu) * 64 + k]
           : 0.0f;
+      // Match the CPU XOR exactly: biases can themselves be negative, so
+      // copysign(bias, q) would discard information.
+      const uint sign = as_type<uint>(q) & 0x80000000u;
+      const float signed_bias =
+          as_type<float>(as_type<uint>(bias) ^ sign);
       input[x] = qi == 0 ? 0.0f
-                         : (q - copysign(bias, q)) *
-                               dequant[component * 64 + k];
+                         : (q - signed_bias) * dequant[component * 64 + k];
     }
     float transformed[8];
     idct8(input, transformed);
