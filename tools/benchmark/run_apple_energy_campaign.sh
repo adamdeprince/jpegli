@@ -8,16 +8,23 @@
 
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-  echo "Usage: $0 JPEGLI_DECODE_BENCHMARK IMAGE_DIRECTORY OUTPUT_DIRECTORY" >&2
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+  echo "Usage: $0 JPEGLI_DECODE_BENCHMARK IMAGE_DIRECTORY OUTPUT_DIRECTORY [METAL_ENTROPY_MODE]" >&2
   exit 1
 fi
 
 benchmark=$1
 images=$2
 output=$3
+entropy_mode=${4:-auto}
 script_directory=$(cd "$(dirname "$0")" && pwd)
 repository=$(git -C "$script_directory/../.." rev-parse --show-toplevel)
+
+if [[ "$entropy_mode" != auto && "$entropy_mode" != off &&
+      "$entropy_mode" != force ]]; then
+  echo "METAL_ENTROPY_MODE must be auto, off, or force" >&2
+  exit 1
+fi
 
 if [[ ! -x "$benchmark" ]]; then
   echo "benchmark is not executable: $benchmark" >&2
@@ -82,6 +89,7 @@ run_case() {
     --energy_trials="$trials" \
     --energy_settle_ms="$settle_ms" \
     --warmups="$warmups" \
+    --metal_entropy="$entropy_mode" \
     --quality="$quality" \
     --chroma_subsampling="$sampling" \
     --progressive_level="$progressive" \

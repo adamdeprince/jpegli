@@ -50,6 +50,11 @@ struct jpeg_decomp_master {
   size_t input_buffer_pos_;
   // Number of bits after codestream_pos_ that were already processed.
   size_t codestream_bits_ahead_;
+  // Original contiguous input, when the built-in memory source manager is in
+  // use. Apple Metal entropy decoding is deliberately limited to this case;
+  // arbitrary and suspending source managers retain the ordinary CPU path.
+  const uint8_t* memory_source_base_ = nullptr;
+  size_t memory_source_size_ = 0;
 
   // Coefficient buffers
   jvirt_barray_ptr* coef_arrays;
@@ -164,6 +169,7 @@ struct jpeg_decomp_master {
   // Objective-C or Metal types into the decoder ABI.
   void* apple_metal_decoder_ = nullptr;
   JpegliAppleMetalMode apple_metal_mode_ = JPEGLI_APPLE_METAL_AUTO;
+  JpegliAppleMetalMode apple_metal_entropy_mode_ = JPEGLI_APPLE_METAL_AUTO;
   JpegliAppleMetalStats apple_metal_stats_ = {};
   bool apple_metal_attempt_ = false;
   bool apple_metal_active_ = false;
@@ -172,6 +178,11 @@ struct jpeg_decomp_master {
   bool apple_metal_bias_stats_enabled_ = false;
   std::vector<int> apple_metal_row_nonzeros_;
   std::vector<int> apple_metal_row_sumabs_;
+  // A successful full-image Metal entropy decode lets the public marker
+  // parser skip the already-validated entropy bytes without changing its
+  // ordinary scan and EOI state transitions.
+  bool apple_metal_entropy_skip_mode_ = false;
+  void* apple_metal_entropy_builder_ = nullptr;
   void* apple_metal_command_buffer_ = nullptr;
   void* apple_metal_destination_texture_ = nullptr;
 };

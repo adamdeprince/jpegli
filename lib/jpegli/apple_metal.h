@@ -74,6 +74,16 @@ typedef struct {
   int fused_pipeline;
   int caller_command_buffer;
   char fallback_reason[128];
+  // Optional entropy acceleration telemetry. A zero used_gpu_entropy means
+  // the ordinary CPU entropy decoder produced the coefficient planes.
+  uint64_t entropy_plan_ns;
+  uint64_t entropy_input_copy_ns;
+  uint64_t entropy_command_encoding_ns;
+  uint64_t gpu_entropy_ns;
+  uint64_t entropy_submission_overhead_ns;
+  uint64_t entropy_total_ns;
+  uint64_t entropy_transient_bytes;
+  int used_gpu_entropy;
 } JpegliAppleMetalStats;
 
 // Selects Metal policy for this decompressor. The default is AUTO. This must
@@ -84,6 +94,17 @@ void jpegli_apple_metal_set_mode(j_decompress_ptr cinfo,
                                  JpegliAppleMetalMode mode);
 
 JpegliAppleMetalMode jpegli_apple_metal_get_mode(j_decompress_ptr cinfo);
+
+// Controls the experimental full-image entropy decoder independently of
+// reconstruction. AUTO uses the measured image-size and compressed-density
+// selector, DISABLED keeps Huffman/scan processing on the CPU, and FORCE is
+// intended for benchmarking and validation. Unsupported streams always fall
+// back to the CPU decoder.
+void jpegli_apple_metal_set_entropy_mode(j_decompress_ptr cinfo,
+                                         JpegliAppleMetalMode mode);
+
+JpegliAppleMetalMode jpegli_apple_metal_get_entropy_mode(
+    j_decompress_ptr cinfo);
 
 // Returns nonzero only when this decoder actually reconstructed with Metal.
 int jpegli_apple_metal_was_used(j_decompress_ptr cinfo);

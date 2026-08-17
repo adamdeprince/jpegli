@@ -66,6 +66,8 @@ void InitializeImage(j_decompress_ptr cinfo) {
   m->apple_metal_bias_stats_enabled_ = false;
   m->apple_metal_row_nonzeros_.clear();
   m->apple_metal_row_sumabs_.clear();
+  m->apple_metal_entropy_skip_mode_ = false;
+  m->apple_metal_entropy_builder_ = nullptr;
   m->apple_metal_command_buffer_ = nullptr;
   m->apple_metal_destination_texture_ = nullptr;
   if (m->decode_profile_enabled_) {
@@ -311,6 +313,10 @@ void PrepareForScan(j_decompress_ptr cinfo) {
   cinfo->input_iMCU_row = 0;
   PrepareForiMCURow(cinfo);
   cinfo->global_state = kDecProcessScan;
+  if (m->apple_metal_entropy_builder_ != nullptr &&
+      !AppleMetalEntropyBeginScan(cinfo)) {
+    m->apple_metal_entropy_builder_ = nullptr;
+  }
 }
 
 int ConsumeInput(j_decompress_ptr cinfo) {
@@ -863,6 +869,14 @@ boolean jpegli_start_decompress(j_decompress_ptr cinfo) {
                             !FROM_JPEGLI_BOOL(cinfo->two_pass_quantize));
       jpegli::AllocateCoefficientBuffer(cinfo);
       jpegli::PrepareForScan(cinfo);
+      // The self-synchronizing Metal entropy decoder reads directly from a
+      // contiguous memory source. It does not advance the public source
+      // manager until every GPU pass has completed and validated, so a
+      // rejected or failed attempt can continue through the ordinary CPU
+      // entropy decoder below without restoring input state.
+      if (m->apple_metal_attempt_) {
+        jpegli::AppleMetalDecodeEntropy(cinfo);
+      }
       if (cinfo->quantize_colors) {
         if (cinfo->colormap != nullptr) {
           cinfo->enable_external_quant = TRUE;
@@ -1179,6 +1193,29 @@ JpegliAppleMetalMode jpegli_apple_metal_get_mode(j_decompress_ptr cinfo) {
     return JPEGLI_APPLE_METAL_DISABLED;
   }
   return cinfo->master->apple_metal_mode_;
+}
+
+void jpegli_apple_metal_set_entropy_mode(j_decompress_ptr cinfo,
+                                         JpegliAppleMetalMode mode) {
+  if (cinfo == nullptr || cinfo->master == nullptr) return;
+  switch (mode) {
+    case JPEGLI_APPLE_METAL_AUTO:
+    case JPEGLI_APPLE_METAL_DISABLED:
+    case JPEGLI_APPLE_METAL_FORCE:
+      cinfo->master->apple_metal_entropy_mode_ = mode;
+      break;
+    default:
+      JPEGLI_ERROR("Invalid Apple Metal entropy mode %d",
+                   static_cast<int>(mode));
+  }
+}
+
+JpegliAppleMetalMode jpegli_apple_metal_get_entropy_mode(
+    j_decompress_ptr cinfo) {
+  if (cinfo == nullptr || cinfo->master == nullptr) {
+    return JPEGLI_APPLE_METAL_DISABLED;
+  }
+  return cinfo->master->apple_metal_entropy_mode_;
 }
 
 int jpegli_apple_metal_was_used(j_decompress_ptr cinfo) {

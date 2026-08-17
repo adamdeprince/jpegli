@@ -40,6 +40,15 @@ JBLOCK* AppleMetalCoefficientPlane(j_decompress_ptr cinfo, int component) {
   return nullptr;
 }
 
+bool AppleMetalEntropyBeginScan(j_decompress_ptr cinfo) { return false; }
+
+bool AppleMetalDecodeEntropy(j_decompress_ptr cinfo) { return false; }
+
+bool AppleMetalSkipEntropyScan(j_decompress_ptr cinfo, const uint8_t* data,
+                               size_t len, size_t* consumed) {
+  return false;
+}
+
 JDIMENSION AppleMetalReadScanlines(j_decompress_ptr cinfo, JSAMPARRAY scanlines,
                                    JDIMENSION max_lines) {
   return 0;
@@ -63,6 +72,8 @@ void AppleMetalResetDecoder(j_decompress_ptr cinfo) {
   cinfo->master->apple_metal_bias_stats_enabled_ = false;
   cinfo->master->apple_metal_row_nonzeros_ = {};
   cinfo->master->apple_metal_row_sumabs_ = {};
+  cinfo->master->apple_metal_entropy_skip_mode_ = false;
+  cinfo->master->apple_metal_entropy_builder_ = nullptr;
   cinfo->master->apple_metal_command_buffer_ = nullptr;
   cinfo->master->apple_metal_destination_texture_ = nullptr;
 }

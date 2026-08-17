@@ -10,6 +10,7 @@
 
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/decode.h"
+#include "lib/jpegli/decode_internal.h"
 #include "lib/jpegli/error.h"
 #include "lib/jpegli/memory_manager.h"
 
@@ -74,6 +75,8 @@ void jpegli_mem_src(j_decompress_ptr cinfo, const unsigned char* inbuffer,
   cinfo->src->skip_input_data = jpegli::skip_input_data;
   cinfo->src->resync_to_restart = jpegli_resync_to_restart;
   cinfo->src->term_source = jpegli::term_source;
+  cinfo->master->memory_source_base_ = inbuffer;
+  cinfo->master->memory_source_size_ = insize;
 }
 
 void jpegli_stdio_src(j_decompress_ptr cinfo, FILE* infile) {
@@ -94,4 +97,6 @@ void jpegli_stdio_src(j_decompress_ptr cinfo, FILE* infile) {
   src->pub.skip_input_data = jpegli::skip_input_data;
   src->pub.resync_to_restart = jpegli_resync_to_restart;
   src->pub.term_source = jpegli::term_source;
+  cinfo->master->memory_source_base_ = nullptr;
+  cinfo->master->memory_source_size_ = 0;
 }

@@ -216,13 +216,53 @@ bool EncodeTestJpeg(size_t width, size_t height, int quality,
   return true;
 }
 
+bool SetLumaQuantizationValue(uint8_t value, std::vector<uint8_t>* encoded) {
+  if (encoded == nullptr || encoded->size() < 4 || (*encoded)[0] != 0xff ||
+      (*encoded)[1] != 0xd8) {
+    return false;
+  }
+  size_t pos = 2;
+  while (pos + 4 <= encoded->size()) {
+    if ((*encoded)[pos] != 0xff) return false;
+    const uint8_t marker = (*encoded)[pos + 1];
+    pos += 2;
+    if (marker == 0xd9 || marker == 0xda) return false;
+    if (marker == 0xd8 || (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+    const size_t length =
+        (static_cast<size_t>((*encoded)[pos]) << 8) | (*encoded)[pos + 1];
+    if (length < 2 || length > encoded->size() - pos) return false;
+    const size_t end = pos + length;
+    if (marker == 0xdb) {
+      size_t table_pos = pos + 2;
+      while (table_pos < end) {
+        const uint8_t table_info = (*encoded)[table_pos++];
+        const size_t bytes_per_value = (table_info >> 4) == 0 ? 1 : 2;
+        const size_t table_bytes = DCTSIZE2 * bytes_per_value;
+        if (table_bytes > end - table_pos) return false;
+        if ((table_info & 15) == 0 && bytes_per_value == 1) {
+          std::fill(encoded->begin() + table_pos,
+                    encoded->begin() + table_pos + DCTSIZE2, value);
+          return true;
+        }
+        table_pos += table_bytes;
+      }
+    }
+    pos = end;
+  }
+  return false;
+}
+
 bool DecodeTestJpeg(const std::vector<uint8_t>& encoded,
                     JpegliAppleMetalMode mode, bool direct,
                     std::vector<uint8_t>* pixels, JpegliAppleMetalStats* stats,
                     unsigned int scale_denom = 1, bool fancy_upsampling = true,
                     size_t crop_x = 0, size_t crop_width = 0,
                     J_COLOR_SPACE output_color_space = JCS_EXT_RGBA,
-                    JpegliDataType output_data_type = JPEGLI_TYPE_UINT8) {
+                    JpegliDataType output_data_type = JPEGLI_TYPE_UINT8,
+                    JpegliAppleMetalMode entropy_mode =
+                        JPEGLI_APPLE_METAL_AUTO) {
   jpeg_decompress_struct cinfo = {};
   TestErrorManager jerr = {};
   JpegliAppleMetalOutput output = {};
@@ -238,6 +278,7 @@ bool DecodeTestJpeg(const std::vector<uint8_t>& encoded,
   jpegli_create_decompress(&cinfo);
   created = true;
   jpegli_apple_metal_set_mode(&cinfo, mode);
+  jpegli_apple_metal_set_entropy_mode(&cinfo, entropy_mode);
   jpegli_mem_src(&cinfo, encoded.data(), encoded.size());
   if (jpegli_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) return false;
   cinfo.out_color_space = output_color_space;
@@ -277,6 +318,16 @@ bool DecodeTestJpeg(const std::vector<uint8_t>& encoded,
   if (exported) jpegli_apple_metal_release_output(&output);
   jpegli_destroy_decompress(&cinfo);
   return true;
+}
+
+bool DecodeTestJpegWithEntropyMode(
+    const std::vector<uint8_t>& encoded, JpegliAppleMetalMode mode,
+    bool direct, JpegliAppleMetalMode entropy_mode,
+    std::vector<uint8_t>* pixels, JpegliAppleMetalStats* stats) {
+  return DecodeTestJpeg(encoded, mode, direct, pixels, stats,
+                        /*scale_denom=*/1, /*fancy_upsampling=*/true,
+                        /*crop_x=*/0, /*crop_width=*/0, JCS_EXT_RGBA,
+                        JPEGLI_TYPE_UINT8, entropy_mode);
 }
 
 bool DecodeSuspended(const std::vector<uint8_t>& encoded,
@@ -365,6 +416,8 @@ TEST(AppleMetalTest, ExactBaselineProgressiveSamplingQualityAndRestart) {
         EXPECT_EQ(cpu, metal) << sampling << " q" << quality;
         EXPECT_EQ(cpu, direct) << sampling << " q" << quality;
         EXPECT_EQ(1, metal_stats.used_metal);
+        EXPECT_EQ(0, metal_stats.used_gpu_entropy)
+            << sampling << " q" << quality << " progressive=" << progressive;
         EXPECT_EQ(0, metal_stats.direct_output);
         EXPECT_EQ(0u, metal_stats.coefficient_copy_ns);
         EXPECT_GT(metal_stats.unified_coefficient_bytes, 0u);
@@ -376,10 +429,158 @@ TEST(AppleMetalTest, ExactBaselineProgressiveSamplingQualityAndRestart) {
           EXPECT_GT(metal_stats.float_plane_bytes, 0u);
         }
         EXPECT_EQ(1, direct_stats.used_metal);
+        EXPECT_EQ(0, direct_stats.used_gpu_entropy);
         EXPECT_EQ(1, direct_stats.direct_output);
       }
     }
   }
+}
+
+TEST(AppleMetalTest, ExactSelfSynchronizingBaselineEntropy) {
+  if (!jpegli_apple_metal_is_available()) GTEST_SKIP();
+  for (int quality : {25, 90, 100}) {
+    for (const char* sampling : {"444", "422", "420"}) {
+      std::vector<uint8_t> encoded;
+      ASSERT_TRUE(EncodeTestJpeg(257, 193, quality, sampling,
+                                 /*progressive=*/false,
+                                 TestJpegColorSpace::kYCbCr,
+                                 /*restart=*/0, &encoded));
+      std::vector<uint8_t> cpu;
+      std::vector<uint8_t> metal;
+      std::vector<uint8_t> direct;
+      JpegliAppleMetalStats stats = {};
+      ASSERT_TRUE(DecodeTestJpeg(encoded, JPEGLI_APPLE_METAL_DISABLED,
+                                 false, &cpu, &stats));
+      ASSERT_TRUE(DecodeTestJpegWithEntropyMode(
+          encoded, JPEGLI_APPLE_METAL_FORCE, false,
+          JPEGLI_APPLE_METAL_FORCE, &metal, &stats));
+      EXPECT_EQ(cpu, metal) << sampling << " q" << quality;
+      EXPECT_EQ(1, stats.used_gpu_entropy);
+      ASSERT_TRUE(DecodeTestJpegWithEntropyMode(
+          encoded, JPEGLI_APPLE_METAL_FORCE, true,
+          JPEGLI_APPLE_METAL_FORCE, &direct, &stats));
+      EXPECT_EQ(cpu, direct) << sampling << " q" << quality;
+      EXPECT_EQ(1, stats.used_gpu_entropy);
+    }
+  }
+
+  for (TestJpegColorSpace color_space :
+       {TestJpegColorSpace::kGrayscale, TestJpegColorSpace::kRGB}) {
+    std::vector<uint8_t> encoded;
+    ASSERT_TRUE(EncodeTestJpeg(259, 195, 92, "444",
+                               /*progressive=*/false, color_space,
+                               /*restart=*/0, &encoded));
+    std::vector<uint8_t> cpu;
+    std::vector<uint8_t> metal;
+    JpegliAppleMetalStats stats = {};
+    ASSERT_TRUE(DecodeTestJpeg(encoded, JPEGLI_APPLE_METAL_DISABLED, false,
+                               &cpu, &stats));
+    ASSERT_TRUE(DecodeTestJpegWithEntropyMode(
+        encoded, JPEGLI_APPLE_METAL_FORCE, false,
+        JPEGLI_APPLE_METAL_FORCE, &metal, &stats));
+    EXPECT_EQ(cpu, metal);
+    EXPECT_EQ(color_space == TestJpegColorSpace::kGrayscale ? 1 : 0,
+              stats.used_gpu_entropy);
+  }
+}
+
+TEST(AppleMetalTest, EntropyModeRoundTrips) {
+  jpeg_decompress_struct cinfo = {};
+  jpeg_error_mgr jerr = {};
+  cinfo.err = jpegli_std_error(&jerr);
+  jpegli_create_decompress(&cinfo);
+  EXPECT_EQ(JPEGLI_APPLE_METAL_AUTO,
+            jpegli_apple_metal_get_entropy_mode(&cinfo));
+  jpegli_apple_metal_set_entropy_mode(&cinfo, JPEGLI_APPLE_METAL_FORCE);
+  EXPECT_EQ(JPEGLI_APPLE_METAL_FORCE,
+            jpegli_apple_metal_get_entropy_mode(&cinfo));
+  jpegli_apple_metal_set_entropy_mode(&cinfo,
+                                      JPEGLI_APPLE_METAL_DISABLED);
+  EXPECT_EQ(JPEGLI_APPLE_METAL_DISABLED,
+            jpegli_apple_metal_get_entropy_mode(&cinfo));
+  jpegli_destroy_decompress(&cinfo);
+}
+
+TEST(AppleMetalTest, EntropyClassifierUsesPixelsDensityAndQuantization) {
+  if (!jpegli_apple_metal_is_available()) GTEST_SKIP();
+  const size_t pixels = static_cast<size_t>(1537) * 1025;
+  std::vector<uint8_t> selected_density;
+  std::vector<uint8_t> excessive_density;
+  std::vector<uint8_t> coarse_quantization;
+  std::vector<uint8_t> direct_sparse;
+  std::vector<uint8_t> low_density;
+  ASSERT_TRUE(EncodeTestJpeg(1537, 1025, 75, "420",
+                             /*progressive=*/false,
+                             TestJpegColorSpace::kYCbCr,
+                             /*restart=*/0, &selected_density));
+  ASSERT_TRUE(SetLumaQuantizationValue(1, &selected_density));
+  ASSERT_TRUE(EncodeTestJpeg(1537, 1025, 100, "420",
+                             /*progressive=*/false,
+                             TestJpegColorSpace::kYCbCr,
+                             /*restart=*/0, &excessive_density));
+  coarse_quantization = selected_density;
+  ASSERT_TRUE(SetLumaQuantizationValue(8, &coarse_quantization));
+  ASSERT_TRUE(EncodeTestJpeg(1537, 1025, 40, "420",
+                             /*progressive=*/false,
+                             TestJpegColorSpace::kYCbCr,
+                             /*restart=*/0, &direct_sparse));
+  ASSERT_TRUE(SetLumaQuantizationValue(1, &direct_sparse));
+  ASSERT_TRUE(EncodeTestJpeg(1537, 1025, 1, "420",
+                             /*progressive=*/false,
+                             TestJpegColorSpace::kYCbCr,
+                             /*restart=*/0, &low_density));
+  ASSERT_GE(selected_density.size() * 32, pixels * 7);
+  ASSERT_LE(selected_density.size() * 16, pixels * 11);
+  ASSERT_GT(excessive_density.size() * 16, pixels * 11);
+  ASSERT_EQ(selected_density.size(), coarse_quantization.size());
+  ASSERT_GE(direct_sparse.size() * 32, pixels * 7);
+  ASSERT_LT(direct_sparse.size() * 8, pixels * 3);
+  ASSERT_LT(low_density.size() * 32, pixels * 7);
+
+  std::vector<uint8_t> cpu;
+  std::vector<uint8_t> metal;
+  JpegliAppleMetalStats stats = {};
+  ASSERT_TRUE(DecodeTestJpeg(selected_density, JPEGLI_APPLE_METAL_DISABLED,
+                             false, &cpu, &stats));
+  jpegli_apple_metal_release_cached_resources(JPEGLI_APPLE_METAL_RELEASE_ALL);
+  ASSERT_TRUE(DecodeTestJpeg(selected_density, JPEGLI_APPLE_METAL_FORCE, false,
+                             &metal, &stats));
+  EXPECT_EQ(cpu, metal);
+  EXPECT_EQ(0, stats.used_gpu_entropy);
+  ASSERT_TRUE(DecodeTestJpeg(selected_density, JPEGLI_APPLE_METAL_FORCE, false,
+                             &metal, &stats));
+  EXPECT_EQ(cpu, metal);
+  EXPECT_EQ(1, stats.used_gpu_entropy);
+
+  ASSERT_TRUE(DecodeTestJpeg(coarse_quantization,
+                             JPEGLI_APPLE_METAL_DISABLED, false, &cpu,
+                             &stats));
+  ASSERT_TRUE(DecodeTestJpeg(coarse_quantization, JPEGLI_APPLE_METAL_FORCE,
+                             false, &metal, &stats));
+  EXPECT_EQ(cpu, metal);
+  EXPECT_EQ(0, stats.used_gpu_entropy);
+
+  ASSERT_TRUE(DecodeTestJpeg(excessive_density,
+                             JPEGLI_APPLE_METAL_DISABLED, false, &cpu,
+                             &stats));
+  ASSERT_TRUE(DecodeTestJpeg(excessive_density, JPEGLI_APPLE_METAL_FORCE,
+                             false, &metal, &stats));
+  EXPECT_EQ(cpu, metal);
+  EXPECT_EQ(0, stats.used_gpu_entropy);
+
+  ASSERT_TRUE(DecodeTestJpeg(direct_sparse, JPEGLI_APPLE_METAL_DISABLED,
+                             false, &cpu, &stats));
+  ASSERT_TRUE(DecodeTestJpeg(direct_sparse, JPEGLI_APPLE_METAL_FORCE, true,
+                             &metal, &stats));
+  EXPECT_EQ(cpu, metal);
+  EXPECT_EQ(0, stats.used_gpu_entropy);
+
+  ASSERT_TRUE(DecodeTestJpeg(low_density, JPEGLI_APPLE_METAL_DISABLED, false,
+                             &cpu, &stats));
+  ASSERT_TRUE(DecodeTestJpeg(low_density, JPEGLI_APPLE_METAL_FORCE, false,
+                             &metal, &stats));
+  EXPECT_EQ(cpu, metal);
+  EXPECT_EQ(0, stats.used_gpu_entropy);
 }
 
 TEST(AppleMetalTest, ExactGrayscaleAndRgbJpeg) {
@@ -398,6 +599,7 @@ TEST(AppleMetalTest, ExactGrayscaleAndRgbJpeg) {
                                &stats));
     EXPECT_EQ(cpu, metal);
     EXPECT_EQ(1, stats.used_metal);
+    EXPECT_EQ(0, stats.used_gpu_entropy);
     EXPECT_EQ(1, stats.fused_pipeline);
     EXPECT_EQ(0u, stats.float_plane_bytes);
   }
@@ -643,6 +845,31 @@ TEST(AppleMetalTest, TruncatedEntropyHasMatchingCpuAndMetalBehavior) {
     const bool metal_ok = DecodeTestJpeg(truncated, JPEGLI_APPLE_METAL_FORCE,
                                          false, &metal, &stats);
     EXPECT_EQ(cpu_ok, metal_ok) << "removed=" << removed;
+    if (cpu_ok && metal_ok) EXPECT_EQ(cpu, metal) << "removed=" << removed;
+  }
+}
+
+TEST(AppleMetalTest, ForcedGpuEntropyFallsBackOnTruncatedBaseline) {
+  if (!jpegli_apple_metal_is_available()) GTEST_SKIP();
+  std::vector<uint8_t> encoded;
+  ASSERT_TRUE(EncodeTestJpeg(1027, 769, 92, "420",
+                             /*progressive=*/false,
+                             TestJpegColorSpace::kYCbCr,
+                             /*restart=*/0, &encoded));
+  for (size_t removed : {size_t{1}, size_t{17}, encoded.size() / 4}) {
+    ASSERT_GT(encoded.size(), removed);
+    std::vector<uint8_t> truncated(encoded.begin(), encoded.end() - removed);
+    std::vector<uint8_t> cpu;
+    std::vector<uint8_t> metal;
+    JpegliAppleMetalStats stats = {};
+    const bool cpu_ok = DecodeTestJpegWithEntropyMode(
+        truncated, JPEGLI_APPLE_METAL_DISABLED, false,
+        JPEGLI_APPLE_METAL_DISABLED, &cpu, &stats);
+    const bool metal_ok = DecodeTestJpegWithEntropyMode(
+        truncated, JPEGLI_APPLE_METAL_FORCE, false,
+        JPEGLI_APPLE_METAL_FORCE, &metal, &stats);
+    EXPECT_EQ(cpu_ok, metal_ok) << "removed=" << removed;
+    EXPECT_EQ(0, stats.used_gpu_entropy) << "removed=" << removed;
     if (cpu_ok && metal_ok) EXPECT_EQ(cpu, metal) << "removed=" << removed;
   }
 }

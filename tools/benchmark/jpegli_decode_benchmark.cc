@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <set>
@@ -40,6 +41,7 @@
 #endif
 
 #if defined(__APPLE__)
+#include <dlfcn.h>
 #include <libproc.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -49,6 +51,7 @@
 #include "lib/base/status.h"
 #include "lib/extras/butteraugli.h"
 #include "lib/extras/dec/decode.h"
+#include "lib/extras/enc/encode.h"
 #include "lib/extras/enc/jpegli.h"
 #include "lib/extras/metrics.h"
 #include "lib/extras/packed_image.h"
@@ -73,6 +76,7 @@ namespace fs = std::filesystem;
 
 constexpr size_t kOutputChannels = 4;
 constexpr size_t kComparedChannels = 3;
+JpegliAppleMetalMode g_metal_entropy_mode = JPEGLI_APPLE_METAL_AUTO;
 
 struct Args {
   void AddCommandLineOptions(CommandLineParser* cmdline) {
@@ -123,6 +127,11 @@ struct Args {
         "comma-separated chroma modes for --perceptual_quality "
         "(default: 444,420)",
         &quality_subsampling, &ParseString);
+    cmdline->AddOptionValue(
+        '\0', "quality_image_dir", "PATH",
+        "save lossless decoder outputs for external perceptual metrics; "
+        "requires --perceptual_quality",
+        &quality_image_dir, &ParseString);
     cmdline->AddOptionFlag(
         '\0', "decode_stage_profile",
         "profile jpegli decode stages instead of comparing decoder speed",
@@ -135,6 +144,10 @@ struct Args {
         '\0', "apple_metal_benchmark",
         "benchmark CPU jpegli, Metal scanlines, and direct Metal output",
         &apple_metal_benchmark, &SetBooleanTrue);
+    cmdline->AddOptionValue(
+        '\0', "metal_entropy", "auto|off|force",
+        "Metal entropy policy for Metal and energy paths (default: auto)",
+        &metal_entropy, &ParseString);
     cmdline->AddOptionFlag(
         '\0', "energy_benchmark",
         "measure long-window per-process decode energy without concurrent "
@@ -170,9 +183,11 @@ struct Args {
   bool perceptual_quality = false;
   std::string quality_levels = "50,75,90,95";
   std::string quality_subsampling = "444,420";
+  std::string quality_image_dir;
   bool decode_stage_profile = false;
   std::string stage_progressive_levels = "0,2";
   bool apple_metal_benchmark = false;
+  std::string metal_entropy = "auto";
   bool energy_benchmark = false;
 #if defined(JPEGLI_BENCHMARK_APPLE_METAL_COMMAND_BUFFER)
   std::string energy_paths =
@@ -219,6 +234,7 @@ struct PerceptualScore {
   std::string decoder;
   double ssimulacra2 = 0.0;
   double butteraugli = 0.0;
+  std::string decoded_image;
 };
 
 struct QualityResult {
@@ -312,6 +328,17 @@ struct EnergySample {
   double process_cpu_seconds = 0.0;
   uint64_t process_energy_nj = 0;
   bool process_energy_available = false;
+  double cpu_rail_energy_mj = 0.0;
+  double gpu_rail_energy_mj = 0.0;
+  double gpu_dram_total_gb_per_second = 0.0;
+  uint64_t gpu_dram_read_bytes = 0;
+  uint64_t gpu_dram_write_bytes = 0;
+  bool cpu_rail_energy_available = false;
+  bool gpu_rail_energy_available = false;
+  bool gpu_dram_bandwidth_available = false;
+  bool gpu_dram_bandwidth_estimated = false;
+  bool gpu_dram_read_write_available = false;
+  JpegliAppleMetalStats metal = {};
 };
 
 struct EnergyImageBenchmark {
@@ -326,6 +353,415 @@ struct JpegliErrorManager {
 };
 
 volatile uint64_t decode_sink = 0;
+
+struct AppleGpuCounters {
+  double cpu_energy_mj = 0.0;
+  double gpu_energy_mj = 0.0;
+  uint64_t dram_read_bytes = 0;
+  uint64_t dram_write_bytes = 0;
+  std::map<std::string, std::map<double, uint64_t>>
+      gpu_bandwidth_histograms;
+  bool cpu_energy_available = false;
+  bool gpu_energy_available = false;
+  bool dram_bandwidth_available = false;
+  bool dram_read_write_available = false;
+  bool dram_bandwidth_histogram_available = false;
+};
+
+#if defined(__APPLE__) && defined(JPEGLI_HAVE_APPLE_IMAGEIO)
+
+struct IOReportSubscription;
+using IOReportSubscriptionRef = IOReportSubscription*;
+
+class AppleIoReportSampler {
+ public:
+  AppleIoReportSampler() { Initialize(); }
+
+  ~AppleIoReportSampler() {
+    if (subscription_ != nullptr) {
+      CFRelease(reinterpret_cast<CFTypeRef>(subscription_));
+    }
+    if (amc_subscription_ != nullptr) {
+      CFRelease(reinterpret_cast<CFTypeRef>(amc_subscription_));
+    }
+    if (pmp_subscription_ != nullptr) {
+      CFRelease(reinterpret_cast<CFTypeRef>(pmp_subscription_));
+    }
+    if (channels_ != nullptr) CFRelease(channels_);
+    if (amc_channels_ != nullptr) CFRelease(amc_channels_);
+    if (pmp_channels_ != nullptr) CFRelease(pmp_channels_);
+    if (library_ != nullptr) dlclose(library_);
+  }
+
+  bool Read(AppleGpuCounters* counters) const {
+    *counters = {};
+    size_t cpu_energy_channels = 0;
+    size_t gpu_energy_channels = 0;
+    size_t read_channels = 0;
+    size_t write_channels = 0;
+    size_t histogram_channels = 0;
+    ReadSubscription(subscription_, channels_, counters, &cpu_energy_channels,
+                     &gpu_energy_channels, &read_channels, &write_channels,
+                     &histogram_channels);
+    ReadSubscription(amc_subscription_, amc_channels_, counters,
+                     &cpu_energy_channels, &gpu_energy_channels,
+                     &read_channels, &write_channels, &histogram_channels);
+    ReadSubscription(pmp_subscription_, pmp_channels_, counters,
+                     &cpu_energy_channels, &gpu_energy_channels,
+                     &read_channels, &write_channels, &histogram_channels);
+    debug_printed_ = true;
+    counters->cpu_energy_available = cpu_energy_channels != 0;
+    counters->gpu_energy_available = gpu_energy_channels != 0;
+    counters->dram_read_write_available =
+        read_channels != 0 && write_channels != 0;
+    counters->dram_bandwidth_histogram_available = histogram_channels != 0;
+    counters->dram_bandwidth_available =
+        counters->dram_read_write_available ||
+        counters->dram_bandwidth_histogram_available;
+    return counters->cpu_energy_available || counters->gpu_energy_available ||
+           counters->dram_bandwidth_available;
+  }
+
+ private:
+  using CopyChannelsInGroup = CFDictionaryRef (*)(CFStringRef, CFStringRef,
+                                                   uint64_t, uint64_t,
+                                                   uint64_t);
+  using CreateSubscription = IOReportSubscriptionRef (*)(
+      void*, CFMutableDictionaryRef, CFMutableDictionaryRef*, uint64_t,
+      CFTypeRef);
+  using CreateSamples = CFDictionaryRef (*)(IOReportSubscriptionRef,
+                                             CFMutableDictionaryRef,
+                                             CFTypeRef);
+  using ChannelString = CFStringRef (*)(CFDictionaryRef);
+  using ChannelFormat = int (*)(CFDictionaryRef);
+  using SimpleInteger = int64_t (*)(CFDictionaryRef, int32_t);
+  using StateCount = int (*)(CFDictionaryRef);
+  using StateResidency = uint64_t (*)(CFDictionaryRef, int32_t);
+  using StateName = CFStringRef (*)(CFDictionaryRef, int32_t);
+
+  template <typename T>
+  bool Load(const char* name, T* function) {
+    *function = reinterpret_cast<T>(dlsym(library_, name));
+    return *function != nullptr;
+  }
+
+  bool ReadSubscription(IOReportSubscriptionRef subscription,
+                        CFMutableDictionaryRef channel_descriptor,
+                        AppleGpuCounters* counters,
+                        size_t* cpu_energy_channels,
+                        size_t* gpu_energy_channels,
+                        size_t* read_channels,
+                        size_t* write_channels,
+                        size_t* histogram_channels) const {
+    if (subscription == nullptr || channel_descriptor == nullptr) return false;
+    CFDictionaryRef sample =
+        create_samples_(subscription, channel_descriptor, nullptr);
+    if (sample == nullptr) {
+      if (!debug_printed_ && getenv("JPEGLI_IOREPORT_DEBUG") != nullptr) {
+        fprintf(stderr, "IOReport subscription returned no sample\n");
+      }
+      return false;
+    }
+    const auto* channels = static_cast<CFArrayRef>(
+        CFDictionaryGetValue(sample, CFSTR("IOReportChannels")));
+    if (channels == nullptr || CFGetTypeID(channels) != CFArrayGetTypeID()) {
+      CFRelease(sample);
+      return false;
+    }
+    const CFIndex count = CFArrayGetCount(channels);
+    for (CFIndex i = 0; i < count; ++i) {
+      const auto* channel = static_cast<CFDictionaryRef>(
+          CFArrayGetValueAtIndex(channels, i));
+      if (channel == nullptr ||
+          CFGetTypeID(channel) != CFDictionaryGetTypeID()) {
+        continue;
+      }
+      const std::string name = CopyString(channel_name_(channel));
+      const std::string unit = CopyString(unit_label_(channel));
+      const int format = channel_format_(channel);
+      if (format == 2 && IsGpuReadWriteHistogram(name)) {
+        const int state_count = state_count_(channel);
+        size_t parsed_states = 0;
+        for (int state = 0; state < state_count; ++state) {
+          double gigabytes_per_second = 0.0;
+          if (!ParseBandwidthBucket(
+                  CopyString(state_name_(channel, state)),
+                  &gigabytes_per_second)) {
+            continue;
+          }
+          counters->gpu_bandwidth_histograms[name][gigabytes_per_second] +=
+              state_residency_(channel, state);
+          ++parsed_states;
+        }
+        if (parsed_states != 0) {
+          ++*histogram_channels;
+          if (!debug_printed_ &&
+              getenv("JPEGLI_IOREPORT_DEBUG") != nullptr) {
+            fprintf(stderr,
+                    "IOReport GPU bandwidth histogram name=%s states=%zu\n",
+                    name.c_str(), parsed_states);
+          }
+        }
+        continue;
+      }
+      const int64_t raw = integer_value_(channel, 0);
+      if (!debug_printed_ && getenv("JPEGLI_IOREPORT_DEBUG") != nullptr &&
+          (name.find("GFX") != std::string::npos ||
+           name.find("GPU") != std::string::npos ||
+           name.find("CPU Energy") != std::string::npos)) {
+        fprintf(stderr, "IOReport channel name=%s unit=%s raw=%lld\n",
+                name.c_str(), unit.c_str(), static_cast<long long>(raw));
+      }
+      if (raw < 0) continue;
+      if (EndsWith(name, "CPU Energy")) {
+        double millijoules = 0.0;
+        if (ConvertEnergyToMillijoules(raw, unit, &millijoules)) {
+          counters->cpu_energy_mj += millijoules;
+          ++*cpu_energy_channels;
+        }
+      } else if (EndsWith(name, "GPU Energy")) {
+        double millijoules = 0.0;
+        if (ConvertEnergyToMillijoules(raw, unit, &millijoules)) {
+          counters->gpu_energy_mj += millijoules;
+          ++*gpu_energy_channels;
+        }
+      } else if (EndsWith(name, "GFX DCS RD")) {
+        uint64_t bytes = 0;
+        if (ConvertDataToBytes(raw, unit, &bytes)) {
+          counters->dram_read_bytes += bytes;
+          ++*read_channels;
+        }
+      } else if (EndsWith(name, "GFX DCS WR")) {
+        uint64_t bytes = 0;
+        if (ConvertDataToBytes(raw, unit, &bytes)) {
+          counters->dram_write_bytes += bytes;
+          ++*write_channels;
+        }
+      }
+    }
+    CFRelease(sample);
+    return true;
+  }
+
+  static std::string CopyString(CFStringRef value) {
+    if (value == nullptr) return {};
+    const CFIndex length = CFStringGetLength(value);
+    const CFIndex capacity =
+        CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
+    if (capacity <= 1) return {};
+    std::vector<char> buffer(static_cast<size_t>(capacity));
+    if (!CFStringGetCString(value, buffer.data(), capacity,
+                            kCFStringEncodingUTF8)) {
+      return {};
+    }
+    return buffer.data();
+  }
+
+  static bool EndsWith(const std::string& value, const char* suffix) {
+    const size_t suffix_size = strlen(suffix);
+    return value.size() >= suffix_size &&
+           value.compare(value.size() - suffix_size, suffix_size, suffix) ==
+               0;
+  }
+
+  static std::string Uppercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    return value;
+  }
+
+  static bool IsGpuReadWriteHistogram(const std::string& name) {
+    const std::string upper = Uppercase(name);
+    if (!EndsWith(upper, " RD+WR")) return false;
+    const std::string requestor = upper.substr(0, upper.size() - 6);
+    return requestor.rfind("AGX", 0) == 0 ||
+           requestor.find(" AGX") != std::string::npos;
+  }
+
+  static bool ParseBandwidthBucket(const std::string& state_name,
+                                   double* gigabytes_per_second) {
+    const size_t begin = state_name.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) return false;
+    const size_t end = state_name.find_last_not_of(" \t\r\n") + 1;
+    const std::string trimmed = state_name.substr(begin, end - begin);
+    const std::string upper = Uppercase(trimmed);
+    if (!EndsWith(upper, "GB/S")) return false;
+    const std::string number = trimmed.substr(0, trimmed.size() - 4);
+    char* parsed_end = nullptr;
+    const double value = strtod(number.c_str(), &parsed_end);
+    if (parsed_end == number.c_str() || !std::isfinite(value) || value < 0.0) {
+      return false;
+    }
+    while (*parsed_end != '\0' &&
+           std::isspace(static_cast<unsigned char>(*parsed_end))) {
+      ++parsed_end;
+    }
+    if (*parsed_end != '\0') return false;
+    *gigabytes_per_second = value;
+    return true;
+  }
+
+  static bool ConvertEnergyToMillijoules(int64_t raw,
+                                         const std::string& unit,
+                                         double* millijoules) {
+    double scale = 0.0;
+    if (unit == "J") {
+      scale = 1.0e3;
+    } else if (unit == "mJ") {
+      scale = 1.0;
+    } else if (unit == "uJ" || unit == "\xC2\xB5J") {
+      scale = 1.0e-3;
+    } else if (unit == "nJ") {
+      scale = 1.0e-6;
+    } else if (unit == "pJ") {
+      scale = 1.0e-9;
+    } else {
+      return false;
+    }
+    *millijoules = static_cast<double>(raw) * scale;
+    return true;
+  }
+
+  static bool ConvertDataToBytes(int64_t raw, const std::string& unit,
+                                 uint64_t* bytes) {
+    uint64_t scale = 0;
+    if (unit == "B" || unit == "bytes") {
+      scale = 1;
+    } else if (unit == "KiB") {
+      scale = 1u << 10;
+    } else if (unit == "MiB") {
+      scale = 1u << 20;
+    } else if (unit == "GiB") {
+      scale = 1u << 30;
+    } else {
+      return false;
+    }
+    const uint64_t value = static_cast<uint64_t>(raw);
+    if (value > std::numeric_limits<uint64_t>::max() / scale) return false;
+    *bytes = value * scale;
+    return true;
+  }
+
+  void Initialize() {
+    library_ = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY | RTLD_LOCAL);
+    if (library_ == nullptr ||
+        !Load("IOReportCopyChannelsInGroup", &copy_channels_) ||
+        !Load("IOReportCreateSubscription", &create_subscription_) ||
+        !Load("IOReportCreateSamples", &create_samples_) ||
+        !Load("IOReportChannelGetChannelName", &channel_name_) ||
+        !Load("IOReportChannelGetUnitLabel", &unit_label_) ||
+        !Load("IOReportChannelGetFormat", &channel_format_) ||
+        !Load("IOReportSimpleGetIntegerValue", &integer_value_) ||
+        !Load("IOReportStateGetCount", &state_count_) ||
+        !Load("IOReportStateGetResidency", &state_residency_) ||
+        !Load("IOReportStateGetNameForIndex", &state_name_)) {
+      return;
+    }
+    CFDictionaryRef energy = copy_channels_(CFSTR("Energy Model"), nullptr, 0,
+                                             0, 0);
+    CFDictionaryRef amc = copy_channels_(CFSTR("AMC Stats"),
+                                         CFSTR("Perf Counters"), 0, 0, 0);
+    InitializeSubscription(energy, &channels_, &subscription_);
+    InitializeSubscription(amc, &amc_channels_, &amc_subscription_);
+    const CFStringRef pmp_groups[] = {CFSTR("PMP"), CFSTR("PMP0"),
+                                      CFSTR("PMP1")};
+    CFDictionaryRef pmp = nullptr;
+    const char* pmp_group = "none";
+    for (size_t i = 0; i < std::size(pmp_groups); ++i) {
+      pmp = copy_channels_(pmp_groups[i], CFSTR("DCS BW"), 0, 0, 0);
+      if (InitializeSubscription(pmp, &pmp_channels_, &pmp_subscription_)) {
+        pmp_group = i == 0 ? "PMP" : (i == 1 ? "PMP0" : "PMP1");
+        break;
+      }
+      if (pmp != nullptr) {
+        CFRelease(pmp);
+        pmp = nullptr;
+      }
+    }
+    if (getenv("JPEGLI_IOREPORT_DEBUG") != nullptr) {
+      fprintf(stderr,
+              "IOReport descriptors energy=%ld amc=%ld pmp=%ld "
+              "subscribed=%ld/%ld/%ld\n",
+              static_cast<long>(ChannelCount(energy)),
+              static_cast<long>(ChannelCount(amc)),
+              static_cast<long>(ChannelCount(pmp)),
+              static_cast<long>(ChannelCount(channels_)),
+              static_cast<long>(ChannelCount(amc_channels_)),
+              static_cast<long>(ChannelCount(pmp_channels_)));
+      fprintf(stderr,
+              "IOReport subscriptions energy=%p amc=%p pmp=%p group=%s\n",
+              static_cast<void*>(subscription_),
+              static_cast<void*>(amc_subscription_),
+              static_cast<void*>(pmp_subscription_), pmp_group);
+    }
+    if (energy != nullptr) CFRelease(energy);
+    if (amc != nullptr) CFRelease(amc);
+    if (pmp != nullptr) CFRelease(pmp);
+  }
+
+  bool InitializeSubscription(CFDictionaryRef source,
+                              CFMutableDictionaryRef* channels,
+                              IOReportSubscriptionRef* subscription) {
+    if (source == nullptr) return false;
+    CFMutableDictionaryRef requested = CFDictionaryCreateMutableCopy(
+        kCFAllocatorDefault, CFDictionaryGetCount(source), source);
+    if (requested == nullptr) return false;
+    CFMutableDictionaryRef subscribed = nullptr;
+    IOReportSubscriptionRef new_subscription =
+        create_subscription_(nullptr, requested, &subscribed, 0, nullptr);
+    CFRelease(requested);
+    if (new_subscription == nullptr || subscribed == nullptr) {
+      if (new_subscription != nullptr) {
+        CFRelease(reinterpret_cast<CFTypeRef>(new_subscription));
+      }
+      if (subscribed != nullptr) CFRelease(subscribed);
+      return false;
+    }
+    *channels = subscribed;
+    *subscription = new_subscription;
+    return true;
+  }
+
+  static CFIndex ChannelCount(CFDictionaryRef channels) {
+    if (channels == nullptr) return 0;
+    const auto* array = static_cast<CFArrayRef>(
+        CFDictionaryGetValue(channels, CFSTR("IOReportChannels")));
+    return array != nullptr && CFGetTypeID(array) == CFArrayGetTypeID()
+               ? CFArrayGetCount(array)
+               : 0;
+  }
+
+  void* library_ = nullptr;
+  CFMutableDictionaryRef channels_ = nullptr;
+  CFMutableDictionaryRef amc_channels_ = nullptr;
+  CFMutableDictionaryRef pmp_channels_ = nullptr;
+  IOReportSubscriptionRef subscription_ = nullptr;
+  IOReportSubscriptionRef amc_subscription_ = nullptr;
+  IOReportSubscriptionRef pmp_subscription_ = nullptr;
+  CopyChannelsInGroup copy_channels_ = nullptr;
+  CreateSubscription create_subscription_ = nullptr;
+  CreateSamples create_samples_ = nullptr;
+  ChannelString channel_name_ = nullptr;
+  ChannelString unit_label_ = nullptr;
+  ChannelFormat channel_format_ = nullptr;
+  SimpleInteger integer_value_ = nullptr;
+  StateCount state_count_ = nullptr;
+  StateResidency state_residency_ = nullptr;
+  StateName state_name_ = nullptr;
+  mutable bool debug_printed_ = false;
+};
+
+#endif
+
+bool ReadAppleGpuCounters(AppleGpuCounters* counters) {
+#if defined(__APPLE__) && defined(JPEGLI_HAVE_APPLE_IMAGEIO)
+  static AppleIoReportSampler sampler;
+  return sampler.Read(counters);
+#else
+  *counters = {};
+  return false;
+#endif
+}
 
 bool ReadProcessEnergy(uint64_t* energy_nj) {
 #if defined(__APPLE__)
@@ -473,7 +909,8 @@ bool EncodeImage(const fs::path& path, const Args& args, ImageBenchmark* image,
 bool DecodeWithJpegli(
     const ImageBenchmark& image, uint8_t* output, std::string* error,
     DecodeStageSample* stage_sample = nullptr,
-    JpegliAppleMetalMode metal_mode = JPEGLI_APPLE_METAL_DISABLED) {
+    JpegliAppleMetalMode metal_mode = JPEGLI_APPLE_METAL_DISABLED,
+    JpegliAppleMetalStats* metal_stats = nullptr) {
   jpeg_decompress_struct cinfo = {};
   JpegliErrorManager jerr = {};
   volatile bool created = false;
@@ -495,6 +932,7 @@ bool DecodeWithJpegli(
   jpegli_create_decompress(&cinfo);
   created = true;
   jpegli_apple_metal_set_mode(&cinfo, metal_mode);
+  jpegli_apple_metal_set_entropy_mode(&cinfo, g_metal_entropy_mode);
   if (stage_sample != nullptr) {
     jpegli::SetDecodeProfileEnabled(&cinfo, true);
   }
@@ -563,6 +1001,9 @@ bool DecodeWithJpegli(
   if (stage_sample != nullptr) {
     stage_sample->internal = jpegli::GetDecodeProfile(&cinfo);
   }
+  if (metal_stats != nullptr) {
+    jpegli_apple_metal_get_stats(&cinfo, metal_stats);
+  }
   jpegli_destroy_decompress(&cinfo);
   if (stage_sample != nullptr) {
     const double end = now();
@@ -623,6 +1064,7 @@ bool DecodeJpegliMetalPath(const ImageBenchmark& image, MetalDecodePath path,
   jpegli_apple_metal_set_mode(&cinfo, path == MetalDecodePath::kCpu
                                           ? JPEGLI_APPLE_METAL_DISABLED
                                           : JPEGLI_APPLE_METAL_FORCE);
+  jpegli_apple_metal_set_entropy_mode(&cinfo, g_metal_entropy_mode);
   jpegli_mem_src(&cinfo, image.jpeg.data(), image.jpeg.size());
   if (jpegli_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
     *error = "jpegli: failed to read JPEG header";
@@ -809,7 +1251,8 @@ bool DecodeJpegliMetalPath(const ImageBenchmark& image, MetalDecodePath path,
 // layout, consumes one output byte, and performs the normal finish/destroy/
 // release lifecycle for every single-image decode.
 bool DecodeJpegliMetalDirectForEnergy(const ImageBenchmark& image,
-                                      std::string* error) {
+                                      std::string* error,
+                                      JpegliAppleMetalStats* metal_stats) {
   jpeg_decompress_struct cinfo = {};
   JpegliErrorManager jerr = {};
   JpegliAppleMetalOutput output = {};
@@ -827,6 +1270,7 @@ bool DecodeJpegliMetalDirectForEnergy(const ImageBenchmark& image,
   jpegli_create_decompress(&cinfo);
   created = true;
   jpegli_apple_metal_set_mode(&cinfo, JPEGLI_APPLE_METAL_FORCE);
+  jpegli_apple_metal_set_entropy_mode(&cinfo, g_metal_entropy_mode);
   jpegli_mem_src(&cinfo, image.jpeg.data(), image.jpeg.size());
   if (jpegli_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
     *error = "jpegli: failed to read JPEG header";
@@ -874,6 +1318,7 @@ bool DecodeJpegliMetalDirectForEnergy(const ImageBenchmark& image,
     jpegli_destroy_decompress(&cinfo);
     return false;
   }
+  if (metal_stats != nullptr) *metal_stats = stats;
   jpegli_destroy_decompress(&cinfo);
   jpegli_apple_metal_release_output(&output);
   return true;
@@ -1004,7 +1449,9 @@ bool EnergyPathUsesMetal(EnergyPath path) {
 }
 
 bool DecodeEnergyPath(EnergyPath path, const ImageBenchmark& image,
-                      uint8_t* output, std::string* error) {
+                      uint8_t* output, std::string* error,
+                      JpegliAppleMetalStats* metal_stats = nullptr) {
+  if (metal_stats != nullptr) *metal_stats = {};
   switch (path) {
     case EnergyPath::kJpegli:
       return DecodeWithJpegli(image, output, error, nullptr,
@@ -1017,9 +1464,9 @@ bool DecodeEnergyPath(EnergyPath path, const ImageBenchmark& image,
 #endif
     case EnergyPath::kMetalScanlines:
       return DecodeWithJpegli(image, output, error, nullptr,
-                              JPEGLI_APPLE_METAL_FORCE);
+                              JPEGLI_APPLE_METAL_FORCE, metal_stats);
     case EnergyPath::kMetalDirect:
-      return DecodeJpegliMetalDirectForEnergy(image, error);
+      return DecodeJpegliMetalDirectForEnergy(image, error, metal_stats);
   }
   *error = "unknown energy benchmark path";
   return false;
@@ -1367,7 +1814,8 @@ jpegli::StatusOr<jpegli::extras::PackedPixelFile> MakeMetricImage(
 
 jpegli::Status ComputePerceptualScore(
     const jpegli::extras::PackedPixelFile& reference, const uint8_t* rgba,
-    size_t width, size_t height, PerceptualScore* score) {
+    size_t width, size_t height, PerceptualScore* score,
+    jpegli::extras::PackedPixelFile* distorted_output = nullptr) {
   JPEGLI_ASSIGN_OR_RETURN(jpegli::extras::PackedPixelFile distorted,
                           MakeMetricImage(reference, rgba, width, height));
   JPEGLI_ASSIGN_OR_RETURN(Msssim msssim,
@@ -1382,6 +1830,47 @@ jpegli::Status ComputePerceptualScore(
   JPEGLI_ENSURE(std::isfinite(score->ssimulacra2));
   JPEGLI_ENSURE(std::isfinite(score->butteraugli));
   JPEGLI_ENSURE(score->butteraugli < std::numeric_limits<float>::max());
+  if (distorted_output != nullptr) {
+    *distorted_output = std::move(distorted);
+  }
+  return true;
+}
+
+fs::path QualityImageRelativePath(const QualityResult& result,
+                                  const std::string& decoder) {
+  std::ostringstream profile;
+  profile << 'q' << std::setfill('0') << std::setw(3) << result.quality << '-'
+          << result.chroma_subsampling << "-p" << result.progressive_level;
+  fs::path filename = fs::path(result.name).filename();
+  filename.replace_extension(".png");
+  return fs::path(profile.str()) / decoder / filename;
+}
+
+bool WriteMetricImage(const jpegli::extras::PackedPixelFile& image,
+                      const fs::path& path, std::string* error) {
+  std::error_code ec;
+  fs::create_directories(path.parent_path(), ec);
+  if (ec) {
+    *error = "failed to create quality image directory " +
+             path.parent_path().string() + ": " + ec.message();
+    return false;
+  }
+  std::unique_ptr<jpegli::extras::Encoder> encoder =
+      jpegli::extras::Encoder::FromExtension(".png");
+  if (encoder == nullptr) {
+    *error = "this build does not provide lossless PNG output";
+    return false;
+  }
+  jpegli::extras::EncodedImage encoded;
+  if (!encoder->Encode(image, &encoded, /*pool=*/nullptr) ||
+      encoded.bitstreams.size() != 1) {
+    *error = "failed to encode quality image " + path.string();
+    return false;
+  }
+  if (!WriteFile(path.string(), encoded.bitstreams.front())) {
+    *error = "failed to write quality image " + path.string();
+    return false;
+  }
   return true;
 }
 
@@ -1487,11 +1976,22 @@ bool RunQualityTask(const QualityTask& task, const Args& args,
     }
     PerceptualScore score;
     score.decoder = DecoderName(decoder);
+    jpegli::extras::PackedPixelFile distorted;
     if (!ComputePerceptualScore(reference, output.data(), image.width,
-                                image.height, &score)) {
+                                image.height, &score, &distorted)) {
       *error = image.name + ": metric computation failed for " +
                DecoderName(decoder);
       return false;
+    }
+    if (!args.quality_image_dir.empty()) {
+      const fs::path relative =
+          QualityImageRelativePath(*result, score.decoder);
+      if (!WriteMetricImage(
+              distorted, fs::path(args.quality_image_dir) / relative, error)) {
+        *error = image.name + ": " + *error;
+        return false;
+      }
+      score.decoded_image = relative.generic_string();
     }
     result->scores.push_back(std::move(score));
   }
@@ -1508,7 +2008,7 @@ bool WriteQualityCsv(const std::string& path,
   }
   out << "image,width,height,quality,chroma_subsampling,progressive_level,"
          "jpeg_bytes,bits_per_pixel,jpegli_version,turbojpeg_api,decoder,"
-         "ssimulacra2,butteraugli\n";
+         "ssimulacra2,butteraugli,decoded_image\n";
   out << std::fixed << std::setprecision(9);
   for (const QualityResult& result : results) {
     const double pixels = static_cast<double>(result.width) * result.height;
@@ -1519,7 +2019,8 @@ bool WriteQualityCsv(const std::string& path,
           << result.chroma_subsampling << ',' << result.progressive_level << ','
           << result.jpeg_bytes << ',' << bits_per_pixel << ',' << kJpegliVersion
           << ',' << TURBOJPEG_VERSION_NUMBER << ',' << score.decoder << ','
-          << score.ssimulacra2 << ',' << score.butteraugli << '\n';
+          << score.ssimulacra2 << ',' << score.butteraugli << ','
+          << CsvEscape(score.decoded_image) << '\n';
     }
   }
   if (!out) {
@@ -1605,6 +2106,15 @@ int RunPerceptualQualitySweep(const std::vector<fs::path>& paths,
     fprintf(stderr, "%s\n", error.c_str());
     return EXIT_FAILURE;
   }
+  if (!args.quality_image_dir.empty()) {
+    std::error_code ec;
+    fs::create_directories(args.quality_image_dir, ec);
+    if (ec) {
+      fprintf(stderr, "failed to create quality image directory %s: %s\n",
+              args.quality_image_dir.c_str(), ec.message().c_str());
+      return EXIT_FAILURE;
+    }
+  }
 
   std::vector<QualityTask> tasks;
   tasks.reserve(paths.size() * qualities.size() * subsamplings.size());
@@ -1630,6 +2140,10 @@ int RunPerceptualQualitySweep(const std::vector<fs::path>& paths,
 #if defined(JPEGLI_HAVE_APPLE_IMAGEIO)
   fprintf(stderr, "Apple ImageIO enabled with explicit sRGB output\n");
 #endif
+  if (!args.quality_image_dir.empty()) {
+    fprintf(stderr, "Lossless external-metric inputs will be written to %s\n",
+            args.quality_image_dir.c_str());
+  }
 
   const size_t progress_step = std::max<size_t>(1, tasks.size() / 20);
   for (size_t index = 0; index < tasks.size(); ++index) {
@@ -1993,6 +2507,12 @@ double Percentile(std::vector<double> values, double percentile) {
   return values[std::min(index, values.size() - 1)];
 }
 
+std::string FormatDouble(double value, int precision) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(precision) << value;
+  return out.str();
+}
+
 std::vector<double> ReadySamples(const std::vector<MetalDecodeSample>& samples,
                                  bool cold) {
   std::vector<double> result;
@@ -2061,7 +2581,11 @@ bool WriteMetalCsv(const std::string& path,
          "total_ms,"
          "ready_process_cpu_ms,ready_process_energy_mj,"
          "ready_process_energy_available,megapixels_per_second,"
-         "cpu_entropy_ms,metal_initialization_ms,coefficient_analysis_ms,"
+         "cpu_entropy_ms,entropy_plan_ms,entropy_input_copy_ms,"
+         "entropy_command_encoding_ms,gpu_entropy_ms,"
+         "entropy_submission_overhead_ms,entropy_total_ms,"
+         "entropy_transient_bytes,used_gpu_entropy,metal_initialization_ms,"
+         "coefficient_analysis_ms,"
          "coefficient_copy_ms,command_encoding_ms,submission_overhead_ms,"
          "gpu_dequant_idct_ms,gpu_upsample_color_ms,gpu_fused_reconstruction_"
          "ms,"
@@ -2094,6 +2618,14 @@ bool WriteMetalCsv(const std::string& path,
             << sample.internal.nanoseconds[static_cast<size_t>(
                    jpegli::DecodeProfileStage::kEntropy)] *
                    1e-6
+            << ',' << sample.metal.entropy_plan_ns * 1e-6 << ','
+            << sample.metal.entropy_input_copy_ns * 1e-6 << ','
+            << sample.metal.entropy_command_encoding_ns * 1e-6 << ','
+            << sample.metal.gpu_entropy_ns * 1e-6 << ','
+            << sample.metal.entropy_submission_overhead_ns * 1e-6 << ','
+            << sample.metal.entropy_total_ns * 1e-6 << ','
+            << sample.metal.entropy_transient_bytes << ','
+            << sample.metal.used_gpu_entropy
             << ',' << sample.metal.metal_initialization_ns * 1e-6 << ','
             << sample.metal.coefficient_analysis_ns * 1e-6 << ','
             << sample.metal.coefficient_copy_ns * 1e-6 << ','
@@ -2415,7 +2947,8 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
       energy_summary = stream.str();
     }
     printf(
-        "  cold CPU/Metal/direct: %.3f / %.3f / %.3f ms; entropy %.3f ms; "
+        "  cold CPU/Metal/direct: %.3f / %.3f / %.3f ms; CPU entropy %.3f "
+        "ms; Metal boundary/GPU entropy/entropy total %.3f/%.3f/%.3f ms; "
         "cold init %.3f ms; analysis %.3f ms; coeff copy %.3f ms; "
         "GPU IDCT %.3f ms; GPU fused/upsample-color %.3f ms; readback copy "
         "%.3f ms; ready process CPU %.3f/%.3f/%.3f ms; process energy "
@@ -2429,6 +2962,9 @@ int RunAppleMetalBenchmark(std::vector<ImageBenchmark> images,
         stage.internal.nanoseconds[static_cast<size_t>(
             jpegli::DecodeProfileStage::kEntropy)] *
             1e-6,
+        stage.metal.entropy_plan_ns * 1e-6,
+        stage.metal.gpu_entropy_ns * 1e-6,
+        stage.metal.entropy_total_ns * 1e-6,
         cold_metal.metal.metal_initialization_ns * 1e-6,
         stage.metal.coefficient_analysis_ns * 1e-6,
         stage.metal.coefficient_copy_ns * 1e-6,
@@ -2593,6 +3129,37 @@ uint64_t UnixTimeNanoseconds() {
           .count());
 }
 
+bool ComputeGpuHistogramBandwidth(const AppleGpuCounters& start,
+                                  const AppleGpuCounters& end,
+                                  double* gigabytes_per_second) {
+  double total = 0.0;
+  size_t channels = 0;
+  for (const auto& end_channel : end.gpu_bandwidth_histograms) {
+    const auto start_channel =
+        start.gpu_bandwidth_histograms.find(end_channel.first);
+    if (start_channel == start.gpu_bandwidth_histograms.end()) continue;
+    long double weighted_residency = 0.0;
+    uint64_t total_residency = 0;
+    for (const auto& end_bucket : end_channel.second) {
+      const auto start_bucket = start_channel->second.find(end_bucket.first);
+      if (start_bucket == start_channel->second.end() ||
+          end_bucket.second < start_bucket->second) {
+        continue;
+      }
+      const uint64_t residency = end_bucket.second - start_bucket->second;
+      weighted_residency +=
+          static_cast<long double>(residency) * end_bucket.first;
+      total_residency += residency;
+    }
+    if (total_residency == 0) continue;
+    total += static_cast<double>(weighted_residency / total_residency);
+    ++channels;
+  }
+  if (channels == 0) return false;
+  *gigabytes_per_second = total;
+  return true;
+}
+
 bool RunEnergyWindow(const ImageBenchmark& image, EnergyPath path, size_t trial,
                      const Args& args, uint8_t* output, EnergySample* sample,
                      std::string* error) {
@@ -2609,13 +3176,18 @@ bool RunEnergyWindow(const ImageBenchmark& image, EnergyPath path, size_t trial,
 
   uint64_t energy_start = 0;
   const bool energy_started = ReadProcessEnergy(&energy_start);
+  AppleGpuCounters apple_start = {};
+  ReadAppleGpuCounters(&apple_start);
   const std::clock_t process_cpu_start = std::clock();
   const auto wall_start = std::chrono::steady_clock::now();
   const double target_seconds = args.energy_window_ms * 1e-3;
   size_t decodes = 0;
+  JpegliAppleMetalStats metal_stats = {};
   do {
     error->clear();
-    if (!DecodeEnergyPath(path, image, output, error)) return false;
+    if (!DecodeEnergyPath(path, image, output, error, &metal_stats)) {
+      return false;
+    }
     if (path != EnergyPath::kMetalDirect) {
       decode_sink ^= output[image.output_size / 2];
     }
@@ -2627,6 +3199,8 @@ bool RunEnergyWindow(const ImageBenchmark& image, EnergyPath path, size_t trial,
   const std::clock_t process_cpu_end = std::clock();
   uint64_t energy_end = 0;
   const bool energy_ended = ReadProcessEnergy(&energy_end);
+  AppleGpuCounters apple_end = {};
+  ReadAppleGpuCounters(&apple_end);
 
   sample->path = path;
   sample->trial = trial;
@@ -2635,18 +3209,64 @@ bool RunEnergyWindow(const ImageBenchmark& image, EnergyPath path, size_t trial,
       std::chrono::duration<double>(wall_end - wall_start).count();
   sample->process_cpu_seconds =
       static_cast<double>(process_cpu_end - process_cpu_start) / CLOCKS_PER_SEC;
+  sample->metal = metal_stats;
   if (energy_started && energy_ended && energy_end > energy_start) {
     sample->process_energy_nj = energy_end - energy_start;
     sample->process_energy_available = true;
   }
+  if (apple_start.cpu_energy_available && apple_end.cpu_energy_available &&
+      apple_end.cpu_energy_mj >= apple_start.cpu_energy_mj) {
+    sample->cpu_rail_energy_mj =
+        apple_end.cpu_energy_mj - apple_start.cpu_energy_mj;
+    sample->cpu_rail_energy_available = true;
+  }
+  if (apple_start.gpu_energy_available && apple_end.gpu_energy_available &&
+      apple_end.gpu_energy_mj >= apple_start.gpu_energy_mj) {
+    sample->gpu_rail_energy_mj =
+        apple_end.gpu_energy_mj - apple_start.gpu_energy_mj;
+    sample->gpu_rail_energy_available = true;
+  }
+  if (apple_start.dram_read_write_available &&
+      apple_end.dram_read_write_available &&
+      apple_end.dram_read_bytes >= apple_start.dram_read_bytes &&
+      apple_end.dram_write_bytes >= apple_start.dram_write_bytes) {
+    sample->gpu_dram_read_bytes =
+        apple_end.dram_read_bytes - apple_start.dram_read_bytes;
+    sample->gpu_dram_write_bytes =
+        apple_end.dram_write_bytes - apple_start.dram_write_bytes;
+    sample->gpu_dram_bandwidth_available = true;
+    sample->gpu_dram_read_write_available = true;
+  } else if (apple_start.dram_bandwidth_histogram_available &&
+             apple_end.dram_bandwidth_histogram_available &&
+             ComputeGpuHistogramBandwidth(
+                 apple_start, apple_end,
+                 &sample->gpu_dram_total_gb_per_second)) {
+    sample->gpu_dram_bandwidth_available = true;
+    sample->gpu_dram_bandwidth_estimated = true;
+  }
+  const double gpu_dram_gigabytes_per_second =
+      sample->gpu_dram_bandwidth_estimated
+          ? sample->gpu_dram_total_gb_per_second
+          : (sample->gpu_dram_read_bytes + sample->gpu_dram_write_bytes) *
+                1e-9 / sample->wall_seconds;
   const uint64_t marker_end_ns = UnixTimeNanoseconds();
   fprintf(stderr,
           "ENERGY_WINDOW_END timestamp_ns=%llu image=%s path=%s trial=%zu "
-          "decodes=%zu wall_ms=%.3f energy_mj=%.6f available=%d\n",
+          "decodes=%zu wall_ms=%.3f energy_mj=%.6f available=%d "
+          "cpu_rail_mj=%.6f cpu_available=%d gpu_rail_mj=%.6f "
+          "gpu_available=%d gfx_dram_gbps=%.6f "
+          "bandwidth_available=%d bandwidth_estimated=%d\n",
           static_cast<unsigned long long>(marker_end_ns), image.name.c_str(),
           EnergyPathName(path), trial, decodes, sample->wall_seconds * 1e3,
           sample->process_energy_nj * 1e-6,
-          sample->process_energy_available ? 1 : 0);
+          sample->process_energy_available ? 1 : 0,
+          sample->cpu_rail_energy_mj,
+          sample->cpu_rail_energy_available ? 1 : 0,
+          sample->gpu_rail_energy_mj,
+          sample->gpu_rail_energy_available ? 1 : 0,
+          gpu_dram_gigabytes_per_second,
+          sample->gpu_dram_bandwidth_available ? 1 : 0,
+          sample->gpu_dram_bandwidth_estimated ? 1 : 0);
   fflush(stderr);
   return true;
 }
@@ -2664,8 +3284,60 @@ double EnergyAveragePowerWatts(const EnergySample& sample) {
   return sample.process_energy_nj * 1e-9 / sample.wall_seconds;
 }
 
+double GpuRailMillijoulesPerDecode(const EnergySample& sample) {
+  return sample.gpu_rail_energy_mj / sample.decodes;
+}
+
+double CpuRailMillijoulesPerDecode(const EnergySample& sample) {
+  return sample.cpu_rail_energy_mj / sample.decodes;
+}
+
+double CpuRailAveragePowerWatts(const EnergySample& sample) {
+  return sample.cpu_rail_energy_mj * 1e-3 / sample.wall_seconds;
+}
+
+double CpuGpuRailMillijoulesPerDecode(const EnergySample& sample) {
+  return (sample.cpu_rail_energy_mj + sample.gpu_rail_energy_mj) /
+         sample.decodes;
+}
+
+double CpuGpuRailAveragePowerWatts(const EnergySample& sample) {
+  return (sample.cpu_rail_energy_mj + sample.gpu_rail_energy_mj) * 1e-3 /
+         sample.wall_seconds;
+}
+
+double GpuRailAveragePowerWatts(const EnergySample& sample) {
+  return sample.gpu_rail_energy_mj * 1e-3 / sample.wall_seconds;
+}
+
+double GpuDramReadGigabytesPerSecond(const EnergySample& sample) {
+  return sample.gpu_dram_read_bytes * 1e-9 / sample.wall_seconds;
+}
+
+double GpuDramWriteGigabytesPerSecond(const EnergySample& sample) {
+  return sample.gpu_dram_write_bytes * 1e-9 / sample.wall_seconds;
+}
+
+double GpuDramTotalGigabytesPerSecond(const EnergySample& sample) {
+  if (sample.gpu_dram_bandwidth_estimated) {
+    return sample.gpu_dram_total_gb_per_second;
+  }
+  return (sample.gpu_dram_read_bytes + sample.gpu_dram_write_bytes) * 1e-9 /
+         sample.wall_seconds;
+}
+
 double EnergyLatencyMilliseconds(const EnergySample& sample) {
   return sample.wall_seconds * 1e3 / sample.decodes;
+}
+
+double CompressedInputMegabytesPerSecond(const EnergySample& sample,
+                                         size_t jpeg_bytes) {
+  return jpeg_bytes * sample.decodes * 1e-6 / sample.wall_seconds;
+}
+
+double RgbaOutputGigabytesPerSecond(const EnergySample& sample,
+                                    size_t output_bytes) {
+  return output_bytes * sample.decodes * 1e-9 / sample.wall_seconds;
 }
 
 bool WriteEnergyCsv(const std::string& path,
@@ -2680,9 +3352,21 @@ bool WriteEnergyCsv(const std::string& path,
          "quality,chroma_subsampling,progressive_level,path,trial,decodes,"
          "requested_window_ms,wall_ms,process_cpu_ms,energy_available,"
          "process_energy_mj,energy_mj_per_decode,energy_mj_per_megapixel,"
-         "average_process_power_w,latency_ms_per_decode,"
-         "process_cpu_ms_per_decode,megapixels_per_second,jpegli_version,"
-         "turbojpeg_api\n";
+         "average_process_power_w,cpu_rail_energy_available,"
+         "cpu_rail_energy_mj,cpu_rail_energy_mj_per_decode,"
+         "average_cpu_rail_power_w,cpu_gpu_rail_energy_available,"
+         "cpu_gpu_rail_energy_mj_per_decode,"
+         "average_cpu_gpu_rail_power_w,gpu_rail_energy_available,"
+         "gpu_rail_energy_mj,gpu_rail_energy_mj_per_decode,"
+         "average_gpu_rail_power_w,gpu_dram_bandwidth_available,"
+         "gpu_dram_bandwidth_estimated,gpu_dram_read_write_available,"
+         "gpu_dram_read_gb_per_second,gpu_dram_write_gb_per_second,"
+         "gpu_dram_total_gb_per_second,latency_ms_per_decode,"
+         "process_cpu_ms_per_decode,megapixels_per_second,"
+         "compressed_input_mb_per_second,rgba_output_gb_per_second,"
+         "requested_metal_entropy_mode,used_gpu_entropy,entropy_plan_ms,"
+         "gpu_entropy_ms,entropy_submission_overhead_ms,entropy_total_ms,"
+         "entropy_transient_bytes,jpegli_version,turbojpeg_api\n";
   out << std::fixed << std::setprecision(9);
   for (const EnergyImageBenchmark& benchmark : benchmarks) {
     const ImageBenchmark& image = benchmark.image;
@@ -2712,9 +3396,67 @@ bool WriteEnergyCsv(const std::string& path,
           << ','
           << (sample.process_energy_available ? EnergyAveragePowerWatts(sample)
                                               : 0.0)
+          << ',' << (sample.cpu_rail_energy_available ? 1 : 0) << ','
+          << sample.cpu_rail_energy_mj << ','
+          << (sample.cpu_rail_energy_available
+                  ? CpuRailMillijoulesPerDecode(sample)
+                  : 0.0)
+          << ','
+          << (sample.cpu_rail_energy_available
+                  ? CpuRailAveragePowerWatts(sample)
+                  : 0.0)
+          << ','
+          << (sample.cpu_rail_energy_available &&
+                      sample.gpu_rail_energy_available
+                  ? 1
+                  : 0)
+          << ','
+          << (sample.cpu_rail_energy_available &&
+                      sample.gpu_rail_energy_available
+                  ? CpuGpuRailMillijoulesPerDecode(sample)
+                  : 0.0)
+          << ','
+          << (sample.cpu_rail_energy_available &&
+                      sample.gpu_rail_energy_available
+                  ? CpuGpuRailAveragePowerWatts(sample)
+                  : 0.0)
+          << ',' << (sample.gpu_rail_energy_available ? 1 : 0) << ','
+          << sample.gpu_rail_energy_mj << ','
+          << (sample.gpu_rail_energy_available
+                  ? GpuRailMillijoulesPerDecode(sample)
+                  : 0.0)
+          << ','
+          << (sample.gpu_rail_energy_available
+                  ? GpuRailAveragePowerWatts(sample)
+                  : 0.0)
+          << ',' << (sample.gpu_dram_bandwidth_available ? 1 : 0) << ','
+          << (sample.gpu_dram_bandwidth_estimated ? 1 : 0) << ','
+          << (sample.gpu_dram_read_write_available ? 1 : 0) << ','
+          << (sample.gpu_dram_read_write_available
+                  ? GpuDramReadGigabytesPerSecond(sample)
+                  : 0.0)
+          << ','
+          << (sample.gpu_dram_read_write_available
+                  ? GpuDramWriteGigabytesPerSecond(sample)
+                  : 0.0)
+          << ','
+          << (sample.gpu_dram_bandwidth_available
+                  ? GpuDramTotalGigabytesPerSecond(sample)
+                  : 0.0)
           << ',' << EnergyLatencyMilliseconds(sample) << ','
           << sample.process_cpu_seconds * 1e3 / sample.decodes << ','
           << pixels * sample.decodes * 1e-6 / sample.wall_seconds << ','
+          << CompressedInputMegabytesPerSecond(sample, image.jpeg.size())
+          << ','
+          << RgbaOutputGigabytesPerSecond(sample, image.output_size) << ','
+          << CsvEscape(EnergyPathUsesMetal(sample.path) ? args.metal_entropy
+                                                        : "")
+          << ',' << sample.metal.used_gpu_entropy << ','
+          << sample.metal.entropy_plan_ns * 1e-6 << ','
+          << sample.metal.gpu_entropy_ns * 1e-6 << ','
+          << sample.metal.entropy_submission_overhead_ns * 1e-6 << ','
+          << sample.metal.entropy_total_ns * 1e-6 << ','
+          << sample.metal.entropy_transient_bytes << ','
           << kJpegliVersion << ',' << TURBOJPEG_VERSION_NUMBER << '\n';
     }
   }
@@ -2727,12 +3469,13 @@ bool WriteEnergyCsv(const std::string& path,
 
 void PrintEnergyResults(const std::vector<EnergyImageBenchmark>& benchmarks,
                         const std::vector<EnergyPath>& paths) {
-  printf("\n%-17s %-15s %7s %-15s %11s %11s %9s %10s %10s\n", "image", "type",
-         "MP", "path", "mJ/img p50", "mJ/img p95", "watts", "ms/image",
-         "mJ/MP");
-  printf("%-17s %-15s %7s %-15s %11s %11s %9s %10s %10s\n", "-----------------",
-         "---------------", "-------", "---------------", "-----------",
-         "-----------", "---------", "----------", "----------");
+  printf("\n%-17s %-15s %7s %-15s %11s %11s %9s %10s %10s %10s %10s\n",
+         "image", "type", "MP", "path", "mJ/img p50", "mJ/img p95",
+         "watts", "ms/image", "mJ/MP", "JPEG MB/s", "RGBA GB/s");
+  printf("%-17s %-15s %7s %-15s %11s %11s %9s %10s %10s %10s %10s\n",
+         "-----------------", "---------------", "-------",
+         "---------------", "-----------", "-----------", "---------",
+         "----------", "----------", "----------", "----------");
   for (const EnergyImageBenchmark& benchmark : benchmarks) {
     const size_t pixels = benchmark.image.width * benchmark.image.height;
     for (EnergyPath path : paths) {
@@ -2740,9 +3483,15 @@ void PrintEnergyResults(const std::vector<EnergyImageBenchmark>& benchmarks,
       std::vector<double> power;
       std::vector<double> latency;
       std::vector<double> energy_per_mp;
+      std::vector<double> compressed_bandwidth;
+      std::vector<double> output_bandwidth;
       for (const EnergySample& sample : benchmark.samples) {
         if (sample.path != path) continue;
         latency.push_back(EnergyLatencyMilliseconds(sample));
+        compressed_bandwidth.push_back(CompressedInputMegabytesPerSecond(
+            sample, benchmark.image.jpeg.size()));
+        output_bandwidth.push_back(
+            RgbaOutputGigabytesPerSecond(sample, benchmark.image.output_size));
         if (!sample.process_energy_available) continue;
         energy_per_decode.push_back(EnergyMillijoulesPerDecode(sample));
         energy_per_mp.push_back(EnergyMillijoulesPerMegapixel(sample, pixels));
@@ -2750,25 +3499,102 @@ void PrintEnergyResults(const std::vector<EnergyImageBenchmark>& benchmarks,
       }
       if (latency.empty()) continue;
       if (energy_per_decode.empty()) {
-        printf("%-17s %-15s %7.3f %-15s %11s %11s %9s %10.3f %10s\n",
+        printf("%-17s %-15s %7.3f %-15s %11s %11s %9s %10.3f %10s %10.2f %10.3f\n",
                ShortName(benchmark.image.name).c_str(),
                EnergyImageType(benchmark.image.name).c_str(), pixels / 1e6,
                EnergyPathName(path), "unavailable", "unavailable", "unavail.",
-               Percentile(latency, 0.50), "unavail.");
+               Percentile(latency, 0.50), "unavail.",
+               Percentile(compressed_bandwidth, 0.50),
+               Percentile(output_bandwidth, 0.50));
       } else {
-        printf("%-17s %-15s %7.3f %-15s %11.4f %11.4f %9.3f %10.3f %10.4f\n",
+        printf("%-17s %-15s %7.3f %-15s %11.4f %11.4f %9.3f %10.3f %10.4f %10.2f %10.3f\n",
                ShortName(benchmark.image.name).c_str(),
                EnergyImageType(benchmark.image.name).c_str(), pixels / 1e6,
                EnergyPathName(path), Percentile(energy_per_decode, 0.50),
                Percentile(energy_per_decode, 0.95), Percentile(power, 0.50),
-               Percentile(latency, 0.50), Percentile(energy_per_mp, 0.50));
+               Percentile(latency, 0.50), Percentile(energy_per_mp, 0.50),
+               Percentile(compressed_bandwidth, 0.50),
+               Percentile(output_bandwidth, 0.50));
       }
+    }
+  }
+  printf("\n%-17s %-15s %11s %11s %12s %8s %8s %9s %11s\n", "image",
+         "path", "CPU mJ/img", "GPU mJ/img", "CPU+GPU mJ", "CPU W",
+         "GPU W", "sum W", "GFX GB/s");
+  printf("%-17s %-15s %11s %11s %12s %8s %8s %9s %11s\n",
+         "-----------------", "---------------", "-----------",
+         "-----------", "------------", "--------", "--------",
+         "---------", "-----------");
+  for (const EnergyImageBenchmark& benchmark : benchmarks) {
+    for (EnergyPath path : paths) {
+      std::vector<double> cpu_energy;
+      std::vector<double> cpu_power;
+      std::vector<double> cpu_gpu_energy;
+      std::vector<double> cpu_gpu_power;
+      std::vector<double> gpu_energy;
+      std::vector<double> gpu_power;
+      std::vector<double> gpu_total;
+      for (const EnergySample& sample : benchmark.samples) {
+        if (sample.path != path) continue;
+        if (sample.cpu_rail_energy_available) {
+          cpu_energy.push_back(CpuRailMillijoulesPerDecode(sample));
+          cpu_power.push_back(CpuRailAveragePowerWatts(sample));
+        }
+        if (sample.gpu_rail_energy_available) {
+          gpu_energy.push_back(GpuRailMillijoulesPerDecode(sample));
+          gpu_power.push_back(GpuRailAveragePowerWatts(sample));
+        }
+        if (sample.cpu_rail_energy_available &&
+            sample.gpu_rail_energy_available) {
+          cpu_gpu_energy.push_back(CpuGpuRailMillijoulesPerDecode(sample));
+          cpu_gpu_power.push_back(CpuGpuRailAveragePowerWatts(sample));
+        }
+        if (sample.gpu_dram_bandwidth_available) {
+          gpu_total.push_back(GpuDramTotalGigabytesPerSecond(sample));
+        }
+      }
+      if (cpu_energy.empty() && gpu_energy.empty() && gpu_total.empty()) {
+        continue;
+      }
+      const std::string cpu_energy_text =
+          cpu_energy.empty() ? "unavailable"
+                             : FormatDouble(Percentile(cpu_energy, 0.50), 4);
+      const std::string gpu_energy_text =
+          gpu_energy.empty() ? "unavailable"
+                             : FormatDouble(Percentile(gpu_energy, 0.50), 4);
+      const std::string cpu_gpu_energy_text =
+          cpu_gpu_energy.empty()
+              ? "unavailable"
+              : FormatDouble(Percentile(cpu_gpu_energy, 0.50), 4);
+      const std::string cpu_watts =
+          cpu_power.empty() ? "unavail."
+                            : FormatDouble(Percentile(cpu_power, 0.50), 3);
+      const std::string gpu_watts =
+          gpu_power.empty() ? "unavail."
+                            : FormatDouble(Percentile(gpu_power, 0.50), 3);
+      const std::string cpu_gpu_watts =
+          cpu_gpu_power.empty()
+              ? "unavail."
+              : FormatDouble(Percentile(cpu_gpu_power, 0.50), 3);
+      const std::string total =
+          gpu_total.empty() ? "unavail."
+                            : FormatDouble(Percentile(gpu_total, 0.50), 3);
+      printf("%-17s %-15s %11s %11s %12s %8s %8s %9s %11s\n",
+             ShortName(benchmark.image.name).c_str(), EnergyPathName(path),
+             cpu_energy_text.c_str(), gpu_energy_text.c_str(),
+             cpu_gpu_energy_text.c_str(), cpu_watts.c_str(),
+             gpu_watts.c_str(), cpu_gpu_watts.c_str(), total.c_str());
     }
   }
   printf(
       "\nEnergy is the macOS per-process ri_energy_nj delta over long serial "
       "windows. Watts are process-attributed energy divided by window wall "
-      "time, not whole-system wall power.\n");
+      "time, not whole-system wall power. CPU and GPU rail energy and GFX DCS "
+      "memory traffic are system-wide IOReport counters and can include "
+      "unrelated work. GFX GB/s is an exact byte rate when AMC counters are "
+      "available, or a residency-weighted PMP histogram estimate otherwise; "
+      "the histogram's top bucket can understate peak traffic. JPEG MB/s and "
+      "RGBA GB/s are effective serial decode delivery rates.\n");
 }
 
 int RunEnergyBenchmark(std::vector<ImageBenchmark> images, const Args& args) {
@@ -2791,6 +3617,23 @@ int RunEnergyBenchmark(std::vector<ImageBenchmark> images, const Args& args) {
             "the macOS per-process energy counter is unavailable on this "
             "host\n");
     return EXIT_FAILURE;
+  }
+  AppleGpuCounters initial_apple = {};
+  if (!ReadAppleGpuCounters(&initial_apple)) {
+    fprintf(stderr,
+            "Apple IOReport rail and memory-controller counters are "
+            "unavailable; their CSV fields will be zero\n");
+  } else {
+    fprintf(stderr,
+            "Apple IOReport counters: CPU energy %s, GPU energy %s, "
+            "GFX DRAM bandwidth %s%s\n",
+            initial_apple.cpu_energy_available ? "available" : "unavailable",
+            initial_apple.gpu_energy_available ? "available" : "unavailable",
+            initial_apple.dram_bandwidth_available ? "available"
+                                                   : "unavailable",
+            initial_apple.dram_bandwidth_histogram_available
+                ? " (PMP histogram estimate)"
+                : "");
   }
 
   size_t max_output_size = 0;
@@ -2899,12 +3742,27 @@ bool ValidateArgs(const Args& args) {
     fprintf(stderr, "--iterations must be greater than zero\n");
     return false;
   }
+  if (args.metal_entropy != "auto" && args.metal_entropy != "off" &&
+      args.metal_entropy != "force") {
+    fprintf(stderr, "--metal_entropy must be auto, off, or force\n");
+    return false;
+  }
   if (args.energy_benchmark && args.energy_window_ms < 100) {
     fprintf(stderr, "--energy_window_ms must be at least 100\n");
     return false;
   }
   if (args.energy_benchmark && args.energy_trials == 0) {
     fprintf(stderr, "--energy_trials must be greater than zero\n");
+    return false;
+  }
+  if (!args.quality_image_dir.empty() && !args.perceptual_quality) {
+    fprintf(stderr, "--quality_image_dir requires --perceptual_quality\n");
+    return false;
+  }
+  if (!args.quality_image_dir.empty() && args.csv.empty()) {
+    fprintf(stderr,
+            "--quality_image_dir requires --csv so exported images have a "
+            "manifest\n");
     return false;
   }
   return true;
@@ -2923,6 +3781,11 @@ int DecodeBenchmarkMain(int argc, const char* argv[]) {
     return cmdline.HelpFlagPassed() ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (!ValidateArgs(args)) return EXIT_FAILURE;
+  g_metal_entropy_mode =
+      args.metal_entropy == "off"
+          ? JPEGLI_APPLE_METAL_DISABLED
+          : (args.metal_entropy == "force" ? JPEGLI_APPLE_METAL_FORCE
+                                             : JPEGLI_APPLE_METAL_AUTO);
 
   std::vector<fs::path> paths;
   std::string error;

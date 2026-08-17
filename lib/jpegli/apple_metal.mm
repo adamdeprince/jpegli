@@ -20,9 +20,12 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <vector>
 
 #include "lib/jpegli/common_internal.h"
+#include "lib/jpegli/decode.h"
 #include "lib/jpegli/decode_internal.h"
+#include "lib/jpegli/error.h"
 #include "lib/jpegli/memory_manager.h"
 #include "lib/jpegli/render.h"
 
@@ -57,6 +60,8 @@ bool SafeMul(size_t a, size_t b, size_t* result) {
 }
 
 constexpr size_t kDefaultCrossoverPixels = 480000;
+constexpr size_t kGpuEntropyMinPixels = 1500000;
+constexpr uint32_t kGpuEntropyMaxLumaQuantSum = 450;
 constexpr size_t kMaxMetalWorkingSet = 512u << 20;
 constexpr size_t kMaxCachedScratch = 96u << 20;
 constexpr size_t kMetalAlignment = 256;
@@ -86,6 +91,35 @@ struct DecodeParams {
   uint32_t variant;
 };
 
+struct EntropyScan {
+  uint32_t first_chunk;
+  uint32_t num_chunks;
+  uint32_t start_offset;
+  uint32_t end_offset;
+  uint32_t Ss;
+  uint32_t Se;
+  uint32_t Ah;
+  uint32_t Al;
+  uint32_t restart_interval;
+  uint32_t mcus_per_row;
+  uint32_t mcu_rows;
+  uint32_t components_in_scan;
+  uint32_t component[3];
+  uint32_t mcu_width[3];
+  uint32_t mcu_height[3];
+  uint32_t dc_lut_offset[3];
+  uint32_t ac_lut_offset[3];
+  uint32_t reserved;
+};
+
+struct EntropySyncState {
+  uint64_t bit_position;
+  uint32_t phase;
+  uint32_t zigzag;
+  uint32_t completed_blocks;
+  uint32_t valid;
+};
+
 enum class KernelVariant : uint32_t {
   kLegacy = 0,
   kGrayscale = 1,
@@ -95,6 +129,13 @@ enum class KernelVariant : uint32_t {
 };
 
 enum class PipelineKind : size_t {
+  kEntropySync,
+  kEntropyPrefix,
+  kEntropyWrite,
+  kEntropyDcSums,
+  kEntropyDcPrefix,
+  kEntropyDcApply,
+  kEntropyStats,
   kCooperativeIdct,
   kLegacyConvert,
   kGrayscale,
@@ -107,10 +148,15 @@ enum class PipelineKind : size_t {
 };
 
 constexpr const char* kPipelineNames[] = {
+    "jpegli_entropy_sync",          "jpegli_entropy_prefix",
+    "jpegli_entropy_write",         "jpegli_entropy_dc_sums",
+    "jpegli_entropy_dc_prefix",     "jpegli_entropy_dc_apply",
+    "jpegli_entropy_stats",
     "jpegli_idct_cooperative",      "jpegli_convert",
     "jpegli_reconstruct_gray",      "jpegli_reconstruct_444",
     "jpegli_reconstruct_422_box",   "jpegli_reconstruct_420_box",
-    "jpegli_reconstruct_422_fancy", "jpegli_reconstruct_420_fancy",
+    "jpegli_reconstruct_422_fancy",
+    "jpegli_reconstruct_420_fancy",
 };
 
 static_assert(std::size(kPipelineNames) == static_cast<size_t>(PipelineKind::kCount),
@@ -118,6 +164,9 @@ static_assert(std::size(kPipelineNames) == static_cast<size_t>(PipelineKind::kCo
 
 static_assert(sizeof(ComponentParams) == 32, "Metal component ABI mismatch");
 static_assert(sizeof(DecodeParams) == 128, "Metal decode ABI mismatch");
+static_assert(sizeof(EntropyScan) == 112, "Metal entropy-scan ABI mismatch");
+static_assert(sizeof(EntropySyncState) == 24,
+              "Metal entropy-sync ABI mismatch");
 static_assert(sizeof(JCOEF) == sizeof(int16_t), "Metal coefficients require 16-bit JCOEF");
 
 #if defined(JPEGLI_APPLE_METAL_PRECOMPILED_LIBRARY)
@@ -139,6 +188,14 @@ struct ComponentParams {
   uint reserved;
 };
 
+struct EntropySyncState {
+  ulong bit_position;
+  uint phase;
+  uint zigzag;
+  uint completed_blocks;
+  uint valid;
+};
+
 struct DecodeParams {
   ComponentParams comp[3];
   uint width;
@@ -150,6 +207,520 @@ struct DecodeParams {
   uint total_imcu_rows;
   uint variant;
 };
+
+struct EntropyScan {
+  uint first_chunk;
+  uint num_chunks;
+  uint start_offset;
+  uint end_offset;
+  uint Ss;
+  uint Se;
+  uint Ah;
+  uint Al;
+  uint restart_interval;
+  uint mcus_per_row;
+  uint mcu_rows;
+  uint components_in_scan;
+  uint component[3];
+  uint mcu_width[3];
+  uint mcu_height[3];
+  uint dc_lut_offset[3];
+  uint ac_lut_offset[3];
+  uint reserved;
+};
+
+constant ushort kEntropyNaturalOrder[64] = {
+   0,  1,  8, 16,  9,  2,  3, 10,
+  17, 24, 32, 25, 18, 11,  4,  5,
+  12, 19, 26, 33, 40, 48, 41, 34,
+  27, 20, 13,  6,  7, 14, 21, 28,
+  35, 42, 49, 56, 57, 50, 43, 36,
+  29, 22, 15, 23, 30, 37, 44, 51,
+  58, 59, 52, 45, 38, 31, 39, 46,
+  53, 60, 61, 54, 47, 55, 62, 63,
+};
+
+inline int entropy_extend(uint value, uint count) {
+  const int threshold = 1 << (count - 1);
+  return int(value) >= threshold ? int(value)
+                                 : int(value) - (1 << count) + 1;
+}
+
+inline void entropy_fail(device atomic_uint* status, uint code) {
+  atomic_fetch_or_explicit(status, code, memory_order_relaxed);
+}
+
+inline uint sync_peek(device const uchar* data, uint data_size,
+                      ulong bit_position, uint count) {
+  const uint byte_position = uint(bit_position >> 3);
+  const uint bit_offset = uint(bit_position & 7ul);
+  ulong word = 0ul;
+  for (uint i = 0; i < 4; ++i) {
+    const uint position = byte_position + i;
+    word = (word << 8) |
+           ulong(position < data_size ? data[position] : uchar(0));
+  }
+  const uint shift = 32u - bit_offset - count;
+  return uint((word >> shift) & ((1ul << count) - 1ul));
+}
+
+inline uint sync_read_symbol(device const uchar* data, uint data_size,
+                             device const uint* tables, uint table_offset,
+                             thread ulong& bit_position) {
+  const uint root_index = sync_peek(data, data_size, bit_position, 8);
+  uint entry = tables[table_offset + root_index];
+  uint bits = entry & 0xffu;
+  if (bits == 0) {
+    ++bit_position;
+    return 256u;
+  }
+  if (bits > 8) {
+    bit_position += 8;
+    const uint extra = bits - 8;
+    const uint index = sync_peek(data, data_size, bit_position, extra);
+    entry = tables[table_offset + root_index + (entry >> 8) + index];
+    bits = entry & 0xffu;
+  }
+  bit_position += bits;
+  return entry >> 8;
+}
+
+inline uint sync_blocks_per_mcu(EntropyScan scan) {
+  uint blocks = 0;
+  for (uint i = 0; i < scan.components_in_scan; ++i) {
+    blocks += scan.mcu_width[i] * scan.mcu_height[i];
+  }
+  return blocks;
+}
+
+inline uint sync_component_for_phase(EntropyScan scan, uint phase) {
+  for (uint i = 0; i < scan.components_in_scan; ++i) {
+    const uint count = scan.mcu_width[i] * scan.mcu_height[i];
+    if (phase < count) return scan.component[i];
+    phase -= count;
+  }
+  return 0xffffffffu;
+}
+
+inline void sync_complete_block(thread EntropySyncState& state,
+                                uint blocks_per_mcu) {
+  state.zigzag = 0;
+  state.phase = state.phase + 1 == blocks_per_mcu ? 0 : state.phase + 1;
+  ++state.completed_blocks;
+}
+
+inline EntropySyncState sync_process_range(
+    device const uchar* data, uint data_size, device const uint* tables,
+    EntropyScan scan, EntropySyncState state, ulong end_bit) {
+  const uint blocks_per_mcu = sync_blocks_per_mcu(scan);
+  state.completed_blocks = 0;
+  state.valid = blocks_per_mcu != 0;
+  const ulong hard_end = min(end_bit, ulong(data_size) * 8ul);
+  ulong iterations = 0;
+  const ulong max_iterations =
+      hard_end > state.bit_position ? hard_end - state.bit_position + 64ul
+                                    : 64ul;
+  while (state.valid != 0 && state.bit_position < hard_end &&
+         iterations++ < max_iterations) {
+    const uint component = sync_component_for_phase(scan, state.phase);
+    if (component >= 3) {
+      state.valid = 0;
+      break;
+    }
+    const ulong before = state.bit_position;
+    if (state.zigzag == 0) {
+      uint symbol = sync_read_symbol(data, data_size, tables,
+                                     scan.dc_lut_offset[component],
+                                     state.bit_position);
+      if (symbol >= 12) symbol = 0;
+      state.bit_position += symbol;
+      state.zigzag = 1;
+    } else {
+      const uint symbol = sync_read_symbol(
+          data, data_size, tables, scan.ac_lut_offset[component],
+          state.bit_position);
+      if (symbol >= 256) {
+        sync_complete_block(state, blocks_per_mcu);
+      } else {
+        const uint run = symbol >> 4;
+        const uint size = symbol & 15u;
+        if (size != 0) {
+          const uint coefficient = state.zigzag + run;
+          state.bit_position += size;
+          if (coefficient >= 64) {
+            sync_complete_block(state, blocks_per_mcu);
+          } else {
+            state.zigzag = coefficient + 1;
+            if (state.zigzag >= 64) {
+              sync_complete_block(state, blocks_per_mcu);
+            }
+          }
+        } else if (run == 15) {
+          state.zigzag += 16;
+          if (state.zigzag >= 64) {
+            sync_complete_block(state, blocks_per_mcu);
+          }
+        } else {
+          sync_complete_block(state, blocks_per_mcu);
+        }
+      }
+    }
+    if (state.bit_position <= before) ++state.bit_position;
+  }
+  if (iterations >= max_iterations) state.valid = 0;
+  return state;
+}
+
+inline bool sync_state_equal(EntropySyncState a, EntropySyncState b) {
+  return a.bit_position == b.bit_position && a.phase == b.phase &&
+         a.zigzag == b.zigzag && a.valid == b.valid;
+}
+
+kernel void jpegli_entropy_sync(
+    device const uchar* data [[buffer(0)]],
+    device const uint* tables [[buffer(1)]],
+    device const EntropySyncState* input_states [[buffer(2)]],
+    device EntropySyncState* output_states [[buffer(3)]],
+    device const uint* input_changed [[buffer(4)]],
+    device uint* output_changed [[buffer(5)]],
+    device atomic_uint* status [[buffer(6)]],
+    constant EntropyScan& scan [[buffer(7)]],
+    constant ulong& data_bits [[buffer(8)]],
+    constant ulong& chunk_bits [[buffer(9)]],
+    constant uint& num_chunks [[buffer(10)]],
+    constant uint& mode [[buffer(11)]],
+    uint tid [[thread_position_in_grid]]) {
+  if (tid >= num_chunks) return;
+  if (mode == 0) {
+    EntropySyncState start = {ulong(tid) * chunk_bits, 0u, 0u, 0u, 1u};
+    if (tid == 0) start.bit_position = 0;
+    output_states[tid] = sync_process_range(
+        data, uint((data_bits + 7ul) >> 3), tables, scan, start,
+        min(ulong(tid + 1) * chunk_bits, data_bits));
+    output_changed[tid] = 1;
+    return;
+  }
+
+  if (tid == 0 || input_changed[tid - 1] == 0) {
+    output_states[tid] = input_states[tid];
+    output_changed[tid] = 0;
+    return;
+  }
+  const EntropySyncState start = input_states[tid - 1];
+  const EntropySyncState next = sync_process_range(
+      data, uint((data_bits + 7ul) >> 3), tables, scan, start,
+      min(ulong(tid + 1) * chunk_bits, data_bits));
+  const bool changed = !sync_state_equal(next, input_states[tid]);
+  output_states[tid] = next;
+  output_changed[tid] = changed ? 1u : 0u;
+  if (mode == 2 && changed) entropy_fail(status, 0x10000u);
+}
+
+kernel void jpegli_entropy_prefix(
+    device const EntropySyncState* states [[buffer(0)]],
+    device uint* prefixes [[buffer(1)]],
+    device atomic_uint* status [[buffer(2)]],
+    constant EntropyScan& scan [[buffer(3)]],
+    constant uint& num_chunks [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]) {
+  if (tid != 0) return;
+  if (atomic_load_explicit(status, memory_order_relaxed) != 0) return;
+  const uint blocks_per_mcu = sync_blocks_per_mcu(scan);
+  const uint expected = scan.mcus_per_row * scan.mcu_rows * blocks_per_mcu;
+  uint completed = 0;
+  for (uint i = 0; i < num_chunks; ++i) {
+    prefixes[i] = completed;
+    const uint available = states[i].completed_blocks;
+    if (completed > expected ||
+        (i + 1 < num_chunks && available > expected - completed) ||
+        (i + 1 == num_chunks && available < expected - completed)) {
+      entropy_fail(status, 0x20000u);
+      return;
+    }
+    completed += i + 1 == num_chunks ? expected - completed : available;
+  }
+  if (completed != expected) entropy_fail(status, 0x40000u);
+}
+
+inline bool sync_block_location(EntropyScan scan, DecodeParams params,
+                                uint global_block, thread uint& component,
+                                thread uint& coefficient_offset,
+                                thread bool& sink) {
+  const uint blocks_per_mcu = sync_blocks_per_mcu(scan);
+  if (blocks_per_mcu == 0) return false;
+  const uint mcu = global_block / blocks_per_mcu;
+  uint phase = global_block - mcu * blocks_per_mcu;
+  uint scan_component = 0;
+  for (; scan_component < scan.components_in_scan; ++scan_component) {
+    const uint count =
+        scan.mcu_width[scan_component] * scan.mcu_height[scan_component];
+    if (phase < count) break;
+    phase -= count;
+  }
+  if (scan_component >= scan.components_in_scan) return false;
+  component = scan.component[scan_component];
+  if (component >= params.num_components) return false;
+  const uint mcu_row = mcu / scan.mcus_per_row;
+  const uint mcu_column = mcu - mcu_row * scan.mcus_per_row;
+  const uint block_x =
+      mcu_column * scan.mcu_width[scan_component] +
+      phase % scan.mcu_width[scan_component];
+  const uint block_y =
+      mcu_row * scan.mcu_height[scan_component] +
+      phase / scan.mcu_width[scan_component];
+  const ComponentParams cp = params.comp[component];
+  sink = block_x >= cp.blocks_w || block_y >= cp.blocks_h;
+  coefficient_offset =
+      sink ? 0u
+           : cp.coeff_offset + (block_y * cp.blocks_w + block_x) * 64;
+  return true;
+}
+
+kernel void jpegli_entropy_write(
+    device const uchar* data [[buffer(0)]],
+    device short* coefficients [[buffer(1)]],
+    device const uint* tables [[buffer(2)]],
+    device const EntropySyncState* states [[buffer(3)]],
+    device const uint* prefixes [[buffer(4)]],
+    device int* dc_diffs [[buffer(5)]],
+    device atomic_uint* status [[buffer(6)]],
+    constant DecodeParams& params [[buffer(7)]],
+    constant EntropyScan& scan [[buffer(8)]],
+    constant ulong& data_bits [[buffer(9)]],
+    constant ulong& chunk_bits [[buffer(10)]],
+    constant uint& num_chunks [[buffer(11)]],
+    uint chunk [[thread_position_in_grid]]) {
+  if (chunk >= num_chunks) return;
+  if (atomic_load_explicit(status, memory_order_relaxed) != 0) return;
+  const uint data_size = uint((data_bits + 7ul) >> 3);
+  const uint blocks_per_mcu = sync_blocks_per_mcu(scan);
+  const uint expected = scan.mcus_per_row * scan.mcu_rows * blocks_per_mcu;
+  EntropySyncState state =
+      chunk == 0 ? EntropySyncState{0ul, 0u, 0u, 0u, 1u}
+                 : states[chunk - 1];
+  uint global_block = prefixes[chunk];
+  if (state.valid == 0 || state.phase != global_block % blocks_per_mcu) {
+    entropy_fail(status, 0x80000u);
+    return;
+  }
+  const ulong end_bit = min(ulong(chunk + 1) * chunk_bits, data_bits);
+  while (state.bit_position < end_bit && global_block < expected) {
+    uint component = 0;
+    uint coefficient_offset = 0;
+    bool sink = false;
+    if (!sync_block_location(scan, params, global_block, component,
+                             coefficient_offset, sink)) {
+      entropy_fail(status, 0x100000u);
+      return;
+    }
+    if (state.zigzag == 0) {
+      const uint symbol = sync_read_symbol(
+          data, data_size, tables, scan.dc_lut_offset[component],
+          state.bit_position);
+      if (symbol >= 12 || state.bit_position > data_bits ||
+          state.bit_position + symbol > data_bits) {
+        entropy_fail(status, 0x200000u);
+        return;
+      }
+      int difference = 0;
+      if (symbol != 0) {
+        difference = entropy_extend(
+            sync_peek(data, data_size, state.bit_position, symbol), symbol);
+        state.bit_position += symbol;
+      }
+      dc_diffs[global_block] = difference;
+      state.zigzag = 1;
+    } else {
+      const uint symbol = sync_read_symbol(
+          data, data_size, tables, scan.ac_lut_offset[component],
+          state.bit_position);
+      if (symbol >= 256 || state.bit_position > data_bits) {
+        entropy_fail(status, 0x400000u);
+        return;
+      }
+      const uint run = symbol >> 4;
+      const uint size = symbol & 15u;
+      if (size != 0) {
+        const uint coefficient = state.zigzag + run;
+        if (coefficient >= 64 || size >= 12 ||
+            state.bit_position + size > data_bits) {
+          entropy_fail(status, 0x800000u);
+          return;
+        }
+        const int value = entropy_extend(
+            sync_peek(data, data_size, state.bit_position, size), size);
+        state.bit_position += size;
+        if (!sink) {
+          coefficients[coefficient_offset +
+                       kEntropyNaturalOrder[coefficient]] = short(value);
+        }
+        state.zigzag = coefficient + 1;
+        if (state.zigzag >= 64) {
+          state.zigzag = 0;
+          state.phase = state.phase + 1 == blocks_per_mcu
+                            ? 0
+                            : state.phase + 1;
+          ++global_block;
+        }
+      } else if (run == 15) {
+        state.zigzag += 16;
+        if (state.zigzag > 64) {
+          entropy_fail(status, 0x1000000u);
+          return;
+        }
+        if (state.zigzag == 64) {
+          state.zigzag = 0;
+          state.phase = state.phase + 1 == blocks_per_mcu
+                            ? 0
+                            : state.phase + 1;
+          ++global_block;
+        }
+      } else {
+        state.zigzag = 0;
+        state.phase =
+            state.phase + 1 == blocks_per_mcu ? 0 : state.phase + 1;
+        ++global_block;
+      }
+    }
+  }
+  if (global_block == expected) {
+    if (chunk + 1 != num_chunks || state.bit_position > data_bits) {
+      entropy_fail(status, 0x8000000u);
+      return;
+    }
+    const uint padding_bits = uint(data_bits - state.bit_position);
+    if (padding_bits > 7 ||
+        (padding_bits != 0 &&
+         sync_peek(data, data_size, state.bit_position, padding_bits) !=
+             (1u << padding_bits) - 1u)) {
+      entropy_fail(status, 0x10000000u);
+    }
+  }
+}
+
+kernel void jpegli_entropy_dc_sums(
+    device const int* dc_diffs [[buffer(0)]],
+    device long* chunk_prefixes [[buffer(1)]],
+    device atomic_uint* status [[buffer(2)]],
+    constant EntropyScan& scan [[buffer(3)]],
+    constant uint& dc_chunk_blocks [[buffer(4)]],
+    constant uint& num_dc_chunks [[buffer(5)]],
+    uint chunk [[thread_position_in_grid]]) {
+  if (chunk >= num_dc_chunks ||
+      atomic_load_explicit(status, memory_order_relaxed) != 0) {
+    return;
+  }
+  const uint blocks_per_mcu = sync_blocks_per_mcu(scan);
+  const uint expected = scan.mcus_per_row * scan.mcu_rows * blocks_per_mcu;
+  const uint begin = chunk * dc_chunk_blocks;
+  const uint end = min(begin + dc_chunk_blocks, expected);
+  long sums[3] = {0l, 0l, 0l};
+  for (uint block = begin; block < end; ++block) {
+    const uint component =
+        sync_component_for_phase(scan, block % blocks_per_mcu);
+    if (component >= 3) {
+      entropy_fail(status, 0x2000000u);
+      return;
+    }
+    sums[component] += long(dc_diffs[block]);
+  }
+  for (uint component = 0; component < 3; ++component) {
+    chunk_prefixes[chunk * 3 + component] = sums[component];
+  }
+}
+
+kernel void jpegli_entropy_dc_prefix(
+    device long* chunk_prefixes [[buffer(0)]],
+    device atomic_uint* status [[buffer(1)]],
+    constant uint& num_components [[buffer(2)]],
+    constant uint& num_dc_chunks [[buffer(3)]],
+    uint component [[thread_position_in_grid]]) {
+  if (component >= num_components ||
+      atomic_load_explicit(status, memory_order_relaxed) != 0) {
+    return;
+  }
+  long predictor = 0l;
+  for (uint chunk = 0; chunk < num_dc_chunks; ++chunk) {
+    const uint index = chunk * 3 + component;
+    const long sum = chunk_prefixes[index];
+    chunk_prefixes[index] = predictor;
+    predictor += sum;
+  }
+}
+
+kernel void jpegli_entropy_dc_apply(
+    device short* coefficients [[buffer(0)]],
+    device const int* dc_diffs [[buffer(1)]],
+    device const long* chunk_prefixes [[buffer(2)]],
+    device atomic_uint* status [[buffer(3)]],
+    constant DecodeParams& params [[buffer(4)]],
+    constant EntropyScan& scan [[buffer(5)]],
+    constant uint& dc_chunk_blocks [[buffer(6)]],
+    constant uint& num_dc_chunks [[buffer(7)]],
+    uint chunk [[thread_position_in_grid]]) {
+  if (chunk >= num_dc_chunks ||
+      atomic_load_explicit(status, memory_order_relaxed) != 0) {
+    return;
+  }
+  const uint blocks_per_mcu = sync_blocks_per_mcu(scan);
+  const uint expected = scan.mcus_per_row * scan.mcu_rows * blocks_per_mcu;
+  const uint begin = chunk * dc_chunk_blocks;
+  const uint end = min(begin + dc_chunk_blocks, expected);
+  long predictors[3] = {
+      chunk_prefixes[chunk * 3], chunk_prefixes[chunk * 3 + 1],
+      chunk_prefixes[chunk * 3 + 2]};
+  for (uint block = begin; block < end; ++block) {
+    uint block_component = 0;
+    uint coefficient_offset = 0;
+    bool sink = false;
+    if (!sync_block_location(scan, params, block, block_component,
+                             coefficient_offset, sink)) {
+      entropy_fail(status, 0x2000000u);
+      return;
+    }
+    predictors[block_component] += long(dc_diffs[block]);
+    if (!sink) {
+      const long predictor = predictors[block_component];
+      if (long(short(predictor)) != predictor) {
+        entropy_fail(status, 0x4000000u);
+        return;
+      }
+      coefficients[coefficient_offset] = short(predictor);
+    }
+  }
+}
+
+kernel void jpegli_entropy_stats(
+    device const short* coefficients [[buffer(0)]],
+    device int* nonzeros [[buffer(1)]],
+    device int* sumabs [[buffer(2)]],
+    constant DecodeParams& params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint values_per_component = params.total_imcu_rows * 64;
+  const uint total = params.num_components * values_per_component;
+  if (index >= total) return;
+  const uint component = index / values_per_component;
+  const uint within = index - component * values_per_component;
+  const uint imcu = within / 64;
+  const uint frequency = within & 63u;
+  const ComponentParams cp = params.comp[component];
+  int count = 0;
+  int absolute_sum = 0;
+  if (cp.h_factor == 1 && cp.v_factor == 1) {
+    const uint first_row = imcu * cp.v_samp_factor;
+    const uint last_row = min(first_row + cp.v_samp_factor, cp.blocks_h);
+    for (uint row = first_row; row < last_row; ++row) {
+      for (uint column = 0; column < cp.blocks_w; ++column) {
+        const int value = int(coefficients[
+            cp.coeff_offset + (row * cp.blocks_w + column) * 64 + frequency]);
+        count += value != 0;
+        absolute_sum += value < 0 ? -value : value;
+      }
+    }
+  }
+  nonzeros[index] = count;
+  sumabs[index] = absolute_sum;
+}
 
 inline void idct2(thread const float* input, thread float* output) {
   const float a = input[0];
@@ -714,6 +1285,13 @@ class MetalContext {
     }
     return pipelines_[index];
   }
+  bool HasInitializedPipeline() {
+    std::lock_guard<std::mutex> lock(pipeline_mutex_);
+    return std::any_of(std::begin(pipelines_), std::end(pipelines_),
+                       [](id<MTLComputePipelineState> pipeline) {
+                         return pipeline != nil;
+                       });
+  }
   id<MTLCounterSampleBuffer> timestamp_samples() const { return timestamp_samples_; }
   std::mutex& command_mutex() { return command_mutex_; }
 
@@ -744,6 +1322,32 @@ std::shared_ptr<MetalContext> GetContext(uint64_t* initialization_ns, std::strin
   return g_context;
 }
 
+struct EntropyPlan {
+  bool building = false;
+  bool valid = false;
+  bool available = false;
+  bool self_sync = false;
+  uint64_t plan_start_ns = 0;
+  size_t skip_scan = 0;
+  std::vector<EntropyScan> scans;
+  std::vector<uint32_t> tables;
+  std::vector<uint8_t> compact_data;
+  id<MTLBuffer> buffer;
+  size_t data_offset = 0;
+  size_t table_offset = 0;
+  size_t nonzero_offset = 0;
+  size_t sumabs_offset = 0;
+  size_t status_offset = 0;
+  size_t sync_state_offset = 0;
+  size_t sync_next_state_offset = 0;
+  size_t sync_changed_offset = 0;
+  size_t sync_next_changed_offset = 0;
+  size_t sync_prefix_offset = 0;
+  size_t sync_dc_diff_offset = 0;
+  size_t sync_dc_prefix_offset = 0;
+  size_t buffer_size = 0;
+};
+
 struct DecoderState {
   ~DecoderState() {
     if (context) context->Return(std::move(scratch));
@@ -756,6 +1360,7 @@ struct DecoderState {
   bool encoded_into_external_command = false;
   DecodeParams params = {};
   size_t output_row_bytes = 0;
+  EntropyPlan entropy;
 };
 
 struct OutputHandle {
@@ -993,8 +1598,652 @@ bool CompleteCommandBuffer(id<MTLCommandBuffer> command_buffer, uint64_t wall_st
   return true;
 }
 
+bool StartEntropyPlan(j_decompress_ptr source, DecoderState* state) {
+  jpeg_decomp_master* m = source->master;
+  EntropyPlan& plan = state->entropy;
+  plan = {};
+  if (m->apple_metal_entropy_mode_ == JPEGLI_APPLE_METAL_DISABLED) {
+    return false;
+  }
+  const bool force_entropy =
+      m->apple_metal_entropy_mode_ == JPEGLI_APPLE_METAL_FORCE;
+  size_t image_pixels = 0;
+  // On M4 Max, the complete self-synchronizing path crossed the CPU entropy
+  // decoder at roughly 1.5 MP for dense, finely quantized images. The first
+  // image also stays on CPU entropy to avoid cold pipeline/submission
+  // overhead. The luma quantization sum separates the profitable Q90 4:2:2
+  // and Q95+ regimes from slower Q90 4:2:0 input without relying on a
+  // caller-supplied quality label. Compressed entropy density is checked after
+  // byte-stuffing is removed, so metadata cannot influence the selector.
+  // FORCE remains available for benchmarks and testing.
+  uint32_t luma_quant_sum = 0;
+  const JQUANT_TBL* luma_quant = nullptr;
+  if (source->comp_info != nullptr && source->num_components > 0) {
+    const int table_index = source->comp_info[0].quant_tbl_no;
+    if (table_index >= 0 && table_index < NUM_QUANT_TBLS) {
+      luma_quant = source->quant_tbl_ptrs[table_index];
+    }
+  }
+  if (luma_quant != nullptr) {
+    for (const UINT16 value : luma_quant->quantval) {
+      luma_quant_sum += value;
+    }
+  }
+  if (!force_entropy &&
+      (!state->context->HasInitializedPipeline() ||
+       !SafeMul(source->image_width, source->image_height, &image_pixels) ||
+       image_pixels < kGpuEntropyMinPixels || luma_quant == nullptr ||
+       luma_quant_sum > kGpuEntropyMaxLumaQuantSum)) {
+    return false;
+  }
+  if (m->memory_source_base_ == nullptr || m->memory_source_size_ < 4 ||
+      m->memory_source_size_ > std::numeric_limits<uint32_t>::max() ||
+      source->progressive_mode || m->is_multiscan_ ||
+      source->restart_interval != 0 ||
+      source->comps_in_scan != source->num_components || source->Ss != 0 ||
+      source->Se != DCTSIZE2 - 1 || source->Ah != 0 || source->Al != 0) {
+    return false;
+  }
+  plan.building = true;
+  plan.valid = true;
+  plan.self_sync = true;
+  plan.plan_start_ns = NowNs();
+  m->apple_metal_entropy_builder_ = state;
+  return true;
+}
+
 }  // namespace
 
+bool AppleMetalEntropyBeginScan(j_decompress_ptr cinfo) {
+  if (cinfo == nullptr || cinfo->master == nullptr || cinfo->src == nullptr) {
+    return false;
+  }
+  jpeg_decomp_master* m = cinfo->master;
+  auto* state = static_cast<DecoderState*>(m->apple_metal_entropy_builder_);
+  if (state == nullptr) {
+    return false;
+  }
+  EntropyPlan& plan = state->entropy;
+  if (!plan.building || !plan.valid || cinfo->num_components < 1 ||
+      cinfo->num_components > 3 ||
+      !plan.scans.empty()) {
+    plan.valid = false;
+    return false;
+  }
+
+  const uintptr_t base =
+      reinterpret_cast<uintptr_t>(m->memory_source_base_);
+  const uintptr_t current =
+      reinterpret_cast<uintptr_t>(cinfo->src->next_input_byte);
+  if (base == 0 || current < base ||
+      current - base > m->memory_source_size_ ||
+      current - base > std::numeric_limits<uint32_t>::max()) {
+    plan.valid = false;
+    return false;
+  }
+
+  EntropyScan scan = {};
+  scan.start_offset = static_cast<uint32_t>(current - base);
+  scan.end_offset = scan.start_offset;
+  scan.Ss = cinfo->Ss;
+  scan.Se = cinfo->Se;
+  scan.Ah = cinfo->Ah;
+  scan.Al = cinfo->Al;
+  scan.restart_interval = cinfo->restart_interval;
+  scan.mcus_per_row = cinfo->MCUs_per_row;
+  scan.mcu_rows = cinfo->MCU_rows_in_scan;
+  scan.components_in_scan = cinfo->comps_in_scan;
+  std::fill(std::begin(scan.dc_lut_offset), std::end(scan.dc_lut_offset),
+            std::numeric_limits<uint32_t>::max());
+  std::fill(std::begin(scan.ac_lut_offset), std::end(scan.ac_lut_offset),
+            std::numeric_limits<uint32_t>::max());
+
+  auto append_table = [&](const HuffmanTableEntry* table,
+                          uint32_t* offset) -> bool {
+    if (plan.tables.size() >
+        std::numeric_limits<uint32_t>::max() - kJpegHuffmanLutSize) {
+      return false;
+    }
+    *offset = static_cast<uint32_t>(plan.tables.size());
+    plan.tables.reserve(plan.tables.size() + kJpegHuffmanLutSize);
+    for (size_t i = 0; i < kJpegHuffmanLutSize; ++i) {
+      plan.tables.push_back(static_cast<uint32_t>(table[i].bits) |
+                            (static_cast<uint32_t>(table[i].value) << 8));
+    }
+    return true;
+  };
+
+  for (int i = 0; i < cinfo->comps_in_scan; ++i) {
+    const jpeg_component_info* comp = cinfo->cur_comp_info[i];
+    const int component = comp->component_index;
+    if (component < 0 || component >= cinfo->num_components) {
+      plan.valid = false;
+      return false;
+    }
+    scan.component[i] = component;
+    scan.mcu_width[i] = comp->MCU_width;
+    scan.mcu_height[i] = comp->MCU_height;
+    if (cinfo->Ss == 0 &&
+        !append_table(
+            &m->dc_huff_lut_[comp->dc_tbl_no * kJpegHuffmanLutSize],
+            &scan.dc_lut_offset[component])) {
+      plan.valid = false;
+      return false;
+    }
+    if (cinfo->Se > 0 &&
+        !append_table(
+            &m->ac_huff_lut_[comp->ac_tbl_no * kJpegHuffmanLutSize],
+            &scan.ac_lut_offset[component])) {
+      plan.valid = false;
+      return false;
+    }
+  }
+
+  plan.scans.push_back(scan);
+  return true;
+}
+
+bool AppleMetalSkipEntropyScan(j_decompress_ptr cinfo, const uint8_t* data,
+                               size_t len, size_t* consumed) {
+  if (consumed != nullptr) *consumed = 0;
+  if (cinfo == nullptr || cinfo->master == nullptr || data == nullptr ||
+      consumed == nullptr) {
+    return false;
+  }
+  jpeg_decomp_master* m = cinfo->master;
+  auto* state = static_cast<DecoderState*>(m->apple_metal_decoder_);
+  if (!m->apple_metal_entropy_skip_mode_ || state == nullptr) return false;
+  EntropyPlan& plan = state->entropy;
+  if (!plan.available || plan.skip_scan >= plan.scans.size()) return false;
+  const EntropyScan& scan = plan.scans[plan.skip_scan];
+  const uintptr_t base =
+      reinterpret_cast<uintptr_t>(m->memory_source_base_);
+  const uintptr_t current = reinterpret_cast<uintptr_t>(data);
+  if (base == 0 || current != base + scan.start_offset ||
+      scan.end_offset < scan.start_offset ||
+      static_cast<size_t>(scan.end_offset - scan.start_offset) > len ||
+      scan.Ss != static_cast<uint32_t>(cinfo->Ss) ||
+      scan.Se != static_cast<uint32_t>(cinfo->Se) ||
+      scan.Ah != static_cast<uint32_t>(cinfo->Ah) ||
+      scan.Al != static_cast<uint32_t>(cinfo->Al) ||
+      scan.restart_interval != cinfo->restart_interval) {
+    return false;
+  }
+  *consumed = scan.end_offset - scan.start_offset;
+  ++plan.skip_scan;
+  return true;
+}
+
+bool AppleMetalDecodeSelfSynchronizingEntropy(j_decompress_ptr cinfo,
+                                               DecoderState* state) {
+  jpeg_decomp_master* m = cinfo->master;
+  EntropyPlan& plan = state->entropy;
+  const uint64_t total_start = NowNs();
+  auto fail = [&]() -> bool {
+    plan.buffer = nil;
+    plan.available = false;
+    plan.building = false;
+    m->apple_metal_entropy_builder_ = nullptr;
+    m->apple_metal_entropy_skip_mode_ = false;
+    m->apple_metal_stats_.used_gpu_entropy = 0;
+    m->apple_metal_stats_.entropy_total_ns = NowNs() - total_start;
+    memset(state->scratch.coefficients.contents, 0,
+           state->scratch.coefficient_capacity);
+    std::fill(m->apple_metal_row_nonzeros_.begin(),
+              m->apple_metal_row_nonzeros_.end(), 0);
+    std::fill(m->apple_metal_row_sumabs_.begin(),
+              m->apple_metal_row_sumabs_.end(), 0);
+    return false;
+  };
+  if (!plan.building || !plan.valid || !plan.self_sync ||
+      plan.scans.size() != 1 || plan.tables.empty() ||
+      m->memory_source_base_ == nullptr) {
+    return fail();
+  }
+
+  EntropyScan& scan = plan.scans[0];
+  const size_t source_size = m->memory_source_size_;
+  size_t position = scan.start_offset;
+  size_t compact_size = 0;
+  bool found_marker = false;
+  while (position < source_size) {
+    const uint8_t* run = m->memory_source_base_ + position;
+    const void* match = memchr(run, 0xff, source_size - position);
+    if (match == nullptr) break;
+    const size_t marker_position =
+        static_cast<const uint8_t*>(match) - m->memory_source_base_;
+    const size_t run_size = marker_position - position;
+    if (!SafeAdd(compact_size, run_size, &compact_size)) return fail();
+    position = marker_position;
+    if (position + 1 >= source_size) break;
+    const uint8_t next = m->memory_source_base_[position + 1];
+    if (next == 0) {
+      if (!SafeAdd(compact_size, static_cast<size_t>(1), &compact_size)) {
+        return fail();
+      }
+      position += 2;
+      continue;
+    }
+    scan.end_offset = static_cast<uint32_t>(position);
+    found_marker = true;
+    break;
+  }
+  if (!found_marker || compact_size == 0 ||
+      compact_size > std::numeric_limits<uint32_t>::max()) {
+    m->apple_metal_stats_.entropy_plan_ns = NowNs() - plan.plan_start_ns;
+    return fail();
+  }
+  if (m->apple_metal_entropy_mode_ == JPEGLI_APPLE_METAL_AUTO) {
+    size_t image_pixels = 0;
+    size_t minimum_weighted_entropy_bytes = 0;
+    size_t minimum_weighted_pixels = 0;
+    size_t maximum_weighted_entropy_bytes = 0;
+    size_t maximum_weighted_pixels = 0;
+    // The measured warm crossover requires 1.75 to 5.5 entropy-coded bits per
+    // output pixel. Direct 4:2:0 output has a higher 3.0-bit lower crossover;
+    // below it, sparse CPU entropy followed by direct reconstruction is still
+    // faster. The upper bound excludes Q100 high-texture input, where the GPU
+    // entropy kernel becomes instruction-bound and no longer beats the CPU.
+    // Integer cross-products avoid floating-point selection and the compact
+    // size excludes headers and application metadata.
+    size_t minimum_byte_weight = 32;
+    size_t minimum_pixel_weight = 7;
+    if (m->apple_metal_direct_ && cinfo->num_components == 3 &&
+        cinfo->comp_info[0].h_samp_factor == 2 &&
+        cinfo->comp_info[0].v_samp_factor == 2 &&
+        cinfo->comp_info[1].h_samp_factor == 1 &&
+        cinfo->comp_info[1].v_samp_factor == 1 &&
+        cinfo->comp_info[2].h_samp_factor == 1 &&
+        cinfo->comp_info[2].v_samp_factor == 1) {
+      minimum_byte_weight = 8;
+      minimum_pixel_weight = 3;
+    }
+    if (!SafeMul(cinfo->image_width, cinfo->image_height, &image_pixels) ||
+        !SafeMul(compact_size, minimum_byte_weight,
+                 &minimum_weighted_entropy_bytes) ||
+        !SafeMul(image_pixels, minimum_pixel_weight,
+                 &minimum_weighted_pixels) ||
+        !SafeMul(compact_size, static_cast<size_t>(16),
+                 &maximum_weighted_entropy_bytes) ||
+        !SafeMul(image_pixels, static_cast<size_t>(11),
+                 &maximum_weighted_pixels) ||
+        minimum_weighted_entropy_bytes < minimum_weighted_pixels ||
+        maximum_weighted_entropy_bytes > maximum_weighted_pixels) {
+      m->apple_metal_stats_.entropy_plan_ns = NowNs() - plan.plan_start_ns;
+      return fail();
+    }
+  }
+
+  // Size the compact stream from the first pass rather than from all bytes
+  // after SOS. This prevents trailing metadata from creating an oversized
+  // temporary allocation. The second pass bulk-copies ordinary byte runs and
+  // removes JPEG's FF00 entropy stuffing.
+  plan.compact_data.resize(compact_size);
+  uint8_t* compact = plan.compact_data.data();
+  size_t output_position = 0;
+  position = scan.start_offset;
+  while (position < scan.end_offset) {
+    const uint8_t* run = m->memory_source_base_ + position;
+    const void* match = memchr(run, 0xff, scan.end_offset - position);
+    if (match == nullptr) {
+      const size_t run_size = scan.end_offset - position;
+      memcpy(compact + output_position, run, run_size);
+      output_position += run_size;
+      position = scan.end_offset;
+      break;
+    }
+    const size_t stuffed_position =
+        static_cast<const uint8_t*>(match) - m->memory_source_base_;
+    const size_t run_size = stuffed_position - position;
+    memcpy(compact + output_position, run, run_size);
+    output_position += run_size;
+    if (stuffed_position + 1 >= scan.end_offset ||
+        m->memory_source_base_[stuffed_position + 1] != 0) {
+      return fail();
+    }
+    compact[output_position++] = 0xff;
+    position = stuffed_position + 2;
+  }
+  m->apple_metal_stats_.entropy_plan_ns = NowNs() - plan.plan_start_ns;
+  if (output_position != compact_size) return fail();
+
+  std::string error;
+  uint64_t initialization_ns = 0;
+  id<MTLComputePipelineState> sync_pipeline = state->context->Pipeline(
+      PipelineKind::kEntropySync, &initialization_ns, &error);
+  id<MTLComputePipelineState> prefix_pipeline = state->context->Pipeline(
+      PipelineKind::kEntropyPrefix, &initialization_ns, &error);
+  id<MTLComputePipelineState> write_pipeline = state->context->Pipeline(
+      PipelineKind::kEntropyWrite, &initialization_ns, &error);
+  id<MTLComputePipelineState> dc_sums_pipeline = state->context->Pipeline(
+      PipelineKind::kEntropyDcSums, &initialization_ns, &error);
+  id<MTLComputePipelineState> dc_prefix_pipeline = state->context->Pipeline(
+      PipelineKind::kEntropyDcPrefix, &initialization_ns, &error);
+  id<MTLComputePipelineState> dc_apply_pipeline = state->context->Pipeline(
+      PipelineKind::kEntropyDcApply, &initialization_ns, &error);
+  id<MTLComputePipelineState> stats_pipeline = state->context->Pipeline(
+      PipelineKind::kEntropyStats, &initialization_ns, &error);
+  m->apple_metal_stats_.metal_initialization_ns += initialization_ns;
+  if (sync_pipeline == nil || prefix_pipeline == nil ||
+      write_pipeline == nil || dc_sums_pipeline == nil ||
+      dc_prefix_pipeline == nil || dc_apply_pipeline == nil ||
+      stats_pipeline == nil) {
+    return fail();
+  }
+
+  const NSUInteger sync_width = std::min<NSUInteger>(
+      256, sync_pipeline.maxTotalThreadsPerThreadgroup);
+  if (sync_width == 0) return fail();
+  constexpr size_t kSyncChunkBytes = 128;
+  const size_t chunk_bytes = kSyncChunkBytes;
+  const size_t num_chunks_size =
+      DivCeil(plan.compact_data.size(), chunk_bytes);
+  if (num_chunks_size == 0 ||
+      num_chunks_size > std::numeric_limits<uint32_t>::max()) {
+    return fail();
+  }
+  const uint32_t num_chunks = static_cast<uint32_t>(num_chunks_size);
+  const uint64_t data_bits =
+      static_cast<uint64_t>(plan.compact_data.size()) * 8;
+  const uint64_t chunk_bits = static_cast<uint64_t>(chunk_bytes) * 8;
+  scan.first_chunk = 0;
+  scan.num_chunks = num_chunks;
+
+  size_t blocks_per_mcu = 0;
+  for (size_t i = 0; i < scan.components_in_scan; ++i) {
+    size_t component_blocks = 0;
+    if (!SafeMul(scan.mcu_width[i], scan.mcu_height[i],
+                 &component_blocks) ||
+        !SafeAdd(blocks_per_mcu, component_blocks, &blocks_per_mcu)) {
+      return fail();
+    }
+  }
+  size_t total_mcus = 0;
+  size_t expected_blocks = 0;
+  if (blocks_per_mcu == 0 ||
+      !SafeMul(scan.mcus_per_row, scan.mcu_rows, &total_mcus) ||
+      !SafeMul(total_mcus, blocks_per_mcu, &expected_blocks) ||
+      expected_blocks > std::numeric_limits<uint32_t>::max()) {
+    return fail();
+  }
+  constexpr uint32_t kDcChunkBlocks = 256;
+  const size_t num_dc_chunks_size =
+      DivCeil(expected_blocks, static_cast<size_t>(kDcChunkBlocks));
+  if (num_dc_chunks_size == 0 ||
+      num_dc_chunks_size > std::numeric_limits<uint32_t>::max()) {
+    return fail();
+  }
+  const uint32_t num_dc_chunks =
+      static_cast<uint32_t>(num_dc_chunks_size);
+
+  auto append_region = [](size_t bytes, size_t* cursor,
+                          size_t* offset) -> bool {
+    const size_t aligned = AlignUp(*cursor, kMetalAlignment);
+    if (aligned == 0 && *cursor != 0) return false;
+    size_t end = 0;
+    if (!SafeAdd(aligned, bytes, &end)) return false;
+    *offset = aligned;
+    *cursor = end;
+    return true;
+  };
+  size_t table_bytes = 0;
+  size_t state_bytes = 0;
+  size_t prefix_bytes = 0;
+  size_t dc_diff_bytes = 0;
+  size_t dc_prefix_values = 0;
+  size_t dc_prefix_bytes = 0;
+  const size_t stat_count = m->apple_metal_row_nonzeros_.size();
+  size_t stat_bytes = 0;
+  if (!SafeMul(plan.tables.size(), sizeof(uint32_t), &table_bytes) ||
+      !SafeMul(num_chunks_size, sizeof(EntropySyncState), &state_bytes) ||
+      !SafeMul(num_chunks_size, sizeof(uint32_t), &prefix_bytes) ||
+      !SafeMul(expected_blocks, sizeof(int32_t), &dc_diff_bytes) ||
+      !SafeMul(num_dc_chunks_size, static_cast<size_t>(3),
+               &dc_prefix_values) ||
+      !SafeMul(dc_prefix_values, sizeof(int64_t), &dc_prefix_bytes) ||
+      !SafeMul(stat_count, sizeof(int32_t), &stat_bytes)) {
+    return fail();
+  }
+  size_t cursor = 0;
+  if (!append_region(plan.compact_data.size(), &cursor, &plan.data_offset) ||
+      !append_region(table_bytes, &cursor, &plan.table_offset) ||
+      !append_region(state_bytes, &cursor, &plan.sync_state_offset) ||
+      !append_region(state_bytes, &cursor, &plan.sync_next_state_offset) ||
+      !append_region(prefix_bytes, &cursor, &plan.sync_changed_offset) ||
+      !append_region(prefix_bytes, &cursor, &plan.sync_next_changed_offset) ||
+      !append_region(prefix_bytes, &cursor, &plan.sync_prefix_offset) ||
+      !append_region(dc_diff_bytes, &cursor, &plan.sync_dc_diff_offset) ||
+      !append_region(dc_prefix_bytes, &cursor,
+                     &plan.sync_dc_prefix_offset) ||
+      !append_region(stat_bytes, &cursor, &plan.nonzero_offset) ||
+      !append_region(stat_bytes, &cursor, &plan.sumabs_offset) ||
+      !append_region(sizeof(uint32_t), &cursor, &plan.status_offset)) {
+    return fail();
+  }
+  plan.buffer_size = AlignUp(cursor, kMetalAlignment);
+  size_t total_working_set = 0;
+  if (plan.buffer_size == 0 ||
+      !SafeAdd(state->scratch.Capacity(), plan.buffer_size,
+               &total_working_set) ||
+      total_working_set > kMaxMetalWorkingSet) {
+    return fail();
+  }
+
+  const uint64_t copy_start = NowNs();
+  plan.buffer = [state->context->device()
+      newBufferWithLength:plan.buffer_size options:MTLResourceStorageModeShared];
+  if (plan.buffer == nil) return fail();
+  uint8_t* bytes = static_cast<uint8_t*>(plan.buffer.contents);
+  memcpy(bytes + plan.data_offset, plan.compact_data.data(),
+         plan.compact_data.size());
+  memcpy(bytes + plan.table_offset, plan.tables.data(), table_bytes);
+  memset(bytes + plan.sync_state_offset, 0, state_bytes);
+  memset(bytes + plan.sync_next_state_offset, 0, state_bytes);
+  memset(bytes + plan.sync_changed_offset, 0, prefix_bytes);
+  memset(bytes + plan.sync_next_changed_offset, 0, prefix_bytes);
+  memset(bytes + plan.sync_prefix_offset, 0, prefix_bytes);
+  memset(bytes + plan.sync_dc_diff_offset, 0, dc_diff_bytes);
+  memset(bytes + plan.sync_dc_prefix_offset, 0, dc_prefix_bytes);
+  memset(bytes + plan.nonzero_offset, 0, stat_bytes);
+  memset(bytes + plan.sumabs_offset, 0, stat_bytes);
+  memset(bytes + plan.status_offset, 0, sizeof(uint32_t));
+  m->apple_metal_stats_.entropy_input_copy_ns = NowNs() - copy_start;
+  m->apple_metal_stats_.entropy_transient_bytes = plan.buffer_size;
+
+  const uint64_t encoding_start = NowNs();
+  std::unique_lock<std::mutex> command_lock(state->context->command_mutex());
+  id<MTLCommandBuffer> command = [state->context->queue() commandBuffer];
+  if (command == nil) return fail();
+
+  id<MTLComputeCommandEncoder> sync = [command computeCommandEncoder];
+  if (sync == nil) return fail();
+  [sync setComputePipelineState:sync_pipeline];
+  auto encode_sync_pass = [&](size_t input_state, size_t output_state,
+                              size_t input_changed, size_t output_changed,
+                              uint32_t mode) {
+    [sync setBuffer:plan.buffer offset:plan.data_offset atIndex:0];
+    [sync setBuffer:plan.buffer offset:plan.table_offset atIndex:1];
+    [sync setBuffer:plan.buffer offset:input_state atIndex:2];
+    [sync setBuffer:plan.buffer offset:output_state atIndex:3];
+    [sync setBuffer:plan.buffer offset:input_changed atIndex:4];
+    [sync setBuffer:plan.buffer offset:output_changed atIndex:5];
+    [sync setBuffer:plan.buffer offset:plan.status_offset atIndex:6];
+    [sync setBytes:&scan length:sizeof(scan) atIndex:7];
+    [sync setBytes:&data_bits length:sizeof(data_bits) atIndex:8];
+    [sync setBytes:&chunk_bits length:sizeof(chunk_bits) atIndex:9];
+    [sync setBytes:&num_chunks length:sizeof(num_chunks) atIndex:10];
+    [sync setBytes:&mode length:sizeof(mode) atIndex:11];
+    [sync dispatchThreads:MTLSizeMake(num_chunks, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(sync_width, 1, 1)];
+  };
+  encode_sync_pass(plan.sync_state_offset, plan.sync_state_offset,
+                   plan.sync_changed_offset, plan.sync_changed_offset,
+                   /*mode=*/0);
+  [sync memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  size_t current_state = plan.sync_state_offset;
+  size_t next_state = plan.sync_next_state_offset;
+  size_t current_changed = plan.sync_changed_offset;
+  size_t next_changed = plan.sync_next_changed_offset;
+  constexpr size_t kSyncPasses = 256;
+  for (size_t pass = 0; pass < kSyncPasses; ++pass) {
+    encode_sync_pass(current_state, next_state, current_changed, next_changed,
+                     /*mode=*/1);
+    [sync memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    std::swap(current_state, next_state);
+    std::swap(current_changed, next_changed);
+  }
+  // One additional pass proves that every chunk starts from a stable
+  // predecessor. A nonzero status rejects the GPU result before the public
+  // source manager has moved.
+  encode_sync_pass(current_state, next_state, current_changed, next_changed,
+                   /*mode=*/2);
+  [sync endEncoding];
+  current_state = next_state;
+
+  id<MTLComputeCommandEncoder> prefix = [command computeCommandEncoder];
+  if (prefix == nil) return fail();
+  [prefix setComputePipelineState:prefix_pipeline];
+  [prefix setBuffer:plan.buffer offset:current_state atIndex:0];
+  [prefix setBuffer:plan.buffer offset:plan.sync_prefix_offset atIndex:1];
+  [prefix setBuffer:plan.buffer offset:plan.status_offset atIndex:2];
+  [prefix setBytes:&scan length:sizeof(scan) atIndex:3];
+  [prefix setBytes:&num_chunks length:sizeof(num_chunks) atIndex:4];
+  [prefix dispatchThreads:MTLSizeMake(1, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+  [prefix endEncoding];
+
+  id<MTLComputeCommandEncoder> writer = [command computeCommandEncoder];
+  if (writer == nil) return fail();
+  [writer setComputePipelineState:write_pipeline];
+  [writer setBuffer:plan.buffer offset:plan.data_offset atIndex:0];
+  [writer setBuffer:state->scratch.coefficients offset:0 atIndex:1];
+  [writer setBuffer:plan.buffer offset:plan.table_offset atIndex:2];
+  [writer setBuffer:plan.buffer offset:current_state atIndex:3];
+  [writer setBuffer:plan.buffer offset:plan.sync_prefix_offset atIndex:4];
+  [writer setBuffer:plan.buffer offset:plan.sync_dc_diff_offset atIndex:5];
+  [writer setBuffer:plan.buffer offset:plan.status_offset atIndex:6];
+  [writer setBytes:&state->params length:sizeof(state->params) atIndex:7];
+  [writer setBytes:&scan length:sizeof(scan) atIndex:8];
+  [writer setBytes:&data_bits length:sizeof(data_bits) atIndex:9];
+  [writer setBytes:&chunk_bits length:sizeof(chunk_bits) atIndex:10];
+  [writer setBytes:&num_chunks length:sizeof(num_chunks) atIndex:11];
+  const NSUInteger writer_width = std::min<NSUInteger>(
+      256, write_pipeline.maxTotalThreadsPerThreadgroup);
+  [writer dispatchThreads:MTLSizeMake(num_chunks, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(writer_width, 1, 1)];
+  [writer endEncoding];
+
+  id<MTLComputeCommandEncoder> dc_sums = [command computeCommandEncoder];
+  if (dc_sums == nil) return fail();
+  [dc_sums setComputePipelineState:dc_sums_pipeline];
+  [dc_sums setBuffer:plan.buffer offset:plan.sync_dc_diff_offset atIndex:0];
+  [dc_sums setBuffer:plan.buffer offset:plan.sync_dc_prefix_offset atIndex:1];
+  [dc_sums setBuffer:plan.buffer offset:plan.status_offset atIndex:2];
+  [dc_sums setBytes:&scan length:sizeof(scan) atIndex:3];
+  [dc_sums setBytes:&kDcChunkBlocks length:sizeof(kDcChunkBlocks) atIndex:4];
+  [dc_sums setBytes:&num_dc_chunks length:sizeof(num_dc_chunks) atIndex:5];
+  const NSUInteger dc_sums_width = std::min<NSUInteger>(
+      256, dc_sums_pipeline.maxTotalThreadsPerThreadgroup);
+  [dc_sums dispatchThreads:MTLSizeMake(num_dc_chunks, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(dc_sums_width, 1, 1)];
+  [dc_sums endEncoding];
+
+  const uint32_t num_components = cinfo->num_components;
+  id<MTLComputeCommandEncoder> dc_prefix = [command computeCommandEncoder];
+  if (dc_prefix == nil) return fail();
+  [dc_prefix setComputePipelineState:dc_prefix_pipeline];
+  [dc_prefix setBuffer:plan.buffer offset:plan.sync_dc_prefix_offset atIndex:0];
+  [dc_prefix setBuffer:plan.buffer offset:plan.status_offset atIndex:1];
+  [dc_prefix setBytes:&num_components length:sizeof(num_components) atIndex:2];
+  [dc_prefix setBytes:&num_dc_chunks length:sizeof(num_dc_chunks) atIndex:3];
+  [dc_prefix dispatchThreads:MTLSizeMake(num_components, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(num_components, 1, 1)];
+  [dc_prefix endEncoding];
+
+  id<MTLComputeCommandEncoder> dc_apply = [command computeCommandEncoder];
+  if (dc_apply == nil) return fail();
+  [dc_apply setComputePipelineState:dc_apply_pipeline];
+  [dc_apply setBuffer:state->scratch.coefficients offset:0 atIndex:0];
+  [dc_apply setBuffer:plan.buffer offset:plan.sync_dc_diff_offset atIndex:1];
+  [dc_apply setBuffer:plan.buffer offset:plan.sync_dc_prefix_offset atIndex:2];
+  [dc_apply setBuffer:plan.buffer offset:plan.status_offset atIndex:3];
+  [dc_apply setBytes:&state->params length:sizeof(state->params) atIndex:4];
+  [dc_apply setBytes:&scan length:sizeof(scan) atIndex:5];
+  [dc_apply setBytes:&kDcChunkBlocks length:sizeof(kDcChunkBlocks) atIndex:6];
+  [dc_apply setBytes:&num_dc_chunks length:sizeof(num_dc_chunks) atIndex:7];
+  const NSUInteger dc_apply_width = std::min<NSUInteger>(
+      256, dc_apply_pipeline.maxTotalThreadsPerThreadgroup);
+  [dc_apply dispatchThreads:MTLSizeMake(num_dc_chunks, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(dc_apply_width, 1, 1)];
+  [dc_apply endEncoding];
+
+  id<MTLComputeCommandEncoder> stats = [command computeCommandEncoder];
+  if (stats == nil) return fail();
+  [stats setComputePipelineState:stats_pipeline];
+  [stats setBuffer:state->scratch.coefficients offset:0 atIndex:0];
+  [stats setBuffer:plan.buffer offset:plan.nonzero_offset atIndex:1];
+  [stats setBuffer:plan.buffer offset:plan.sumabs_offset atIndex:2];
+  [stats setBytes:&state->params length:sizeof(state->params) atIndex:3];
+  const NSUInteger stats_width = std::min<NSUInteger>(
+      256, stats_pipeline.maxTotalThreadsPerThreadgroup);
+  [stats dispatchThreads:MTLSizeMake(stat_count, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(stats_width, 1, 1)];
+  [stats endEncoding];
+  m->apple_metal_stats_.entropy_command_encoding_ns =
+      NowNs() - encoding_start;
+
+  uint64_t gpu_ns = 0;
+  uint64_t overhead_ns = 0;
+  const bool command_ok =
+      CompleteCommandBuffer(command, NowNs(), &gpu_ns, &overhead_ns, &error);
+  const uint32_t entropy_status =
+      *reinterpret_cast<const uint32_t*>(bytes + plan.status_offset);
+  if (!command_ok || entropy_status != 0) {
+    m->apple_metal_stats_.gpu_entropy_ns = gpu_ns;
+    m->apple_metal_stats_.entropy_submission_overhead_ns = overhead_ns;
+    return fail();
+  }
+  const int32_t* nonzeros = reinterpret_cast<const int32_t*>(
+      bytes + plan.nonzero_offset);
+  const int32_t* sumabs =
+      reinterpret_cast<const int32_t*>(bytes + plan.sumabs_offset);
+  std::copy(nonzeros, nonzeros + stat_count,
+            m->apple_metal_row_nonzeros_.begin());
+  std::copy(sumabs, sumabs + stat_count,
+            m->apple_metal_row_sumabs_.begin());
+
+  plan.buffer = nil;
+  plan.buffer_size = 0;
+  plan.compact_data.clear();
+  plan.compact_data.shrink_to_fit();
+  plan.tables.clear();
+  plan.tables.shrink_to_fit();
+  plan.building = false;
+  plan.available = true;
+  plan.skip_scan = 0;
+  m->apple_metal_entropy_builder_ = nullptr;
+  m->apple_metal_entropy_skip_mode_ = true;
+  m->apple_metal_stats_.gpu_entropy_ns = gpu_ns;
+  m->apple_metal_stats_.entropy_submission_overhead_ns = overhead_ns;
+  m->apple_metal_stats_.entropy_total_ns = NowNs() - total_start;
+  m->apple_metal_stats_.used_gpu_entropy = 1;
+  return true;
+}
+
+bool AppleMetalDecodeEntropy(j_decompress_ptr cinfo) {
+  @autoreleasepool {
+    if (cinfo == nullptr || cinfo->master == nullptr) return false;
+    jpeg_decomp_master* m = cinfo->master;
+    auto* state = static_cast<DecoderState*>(m->apple_metal_decoder_);
+    if (state == nullptr || state->context == nullptr ||
+        state->scratch.coefficients == nil) {
+      return false;
+    }
+    EntropyPlan& plan = state->entropy;
+    if (!plan.building || !plan.self_sync) return false;
+    return AppleMetalDecodeSelfSynchronizingEntropy(cinfo, state);
+  }
+}
 bool AppleMetalShouldAttempt(j_decompress_ptr cinfo, bool direct_output) {
   const char* reason = nullptr;
   if (!BasicEligibility(cinfo, direct_output, &reason)) {
@@ -1057,6 +2306,7 @@ bool AppleMetalPrepareCoefficientStorage(j_decompress_ptr cinfo) {
     m->apple_metal_row_nonzeros_.assign(stat_count, 0);
     m->apple_metal_row_sumabs_.assign(stat_count, 0);
     m->apple_metal_bias_stats_enabled_ = true;
+    StartEntropyPlan(cinfo, state.get());
     m->apple_metal_decoder_ = state.release();
     return true;
   }
@@ -1493,6 +2743,8 @@ void AppleMetalResetDecoder(j_decompress_ptr cinfo) {
   m->apple_metal_bias_stats_enabled_ = false;
   m->apple_metal_row_nonzeros_ = {};
   m->apple_metal_row_sumabs_ = {};
+  m->apple_metal_entropy_skip_mode_ = false;
+  m->apple_metal_entropy_builder_ = nullptr;
   m->apple_metal_command_buffer_ = nullptr;
   m->apple_metal_destination_texture_ = nullptr;
 }

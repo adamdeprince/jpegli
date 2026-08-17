@@ -24,6 +24,15 @@ bool AppleMetalShouldAttempt(j_decompress_ptr cinfo, bool direct_output);
 bool AppleMetalPrepareCoefficientStorage(j_decompress_ptr cinfo);
 JBLOCK* AppleMetalCoefficientPlane(j_decompress_ptr cinfo, int component);
 
+// Builds and executes the optional full-image entropy plan. Successful
+// execution fills the shared coefficient planes and lets the public decoder
+// skip the already-validated entropy bytes. All functions have CPU-only
+// stubs.
+bool AppleMetalEntropyBeginScan(j_decompress_ptr cinfo);
+bool AppleMetalDecodeEntropy(j_decompress_ptr cinfo);
+bool AppleMetalSkipEntropyScan(j_decompress_ptr cinfo, const uint8_t* data,
+                               size_t len, size_t* consumed);
+
 // Reconstructs the decoded coefficient planes. PrepareForOutput must already
 // have been called and all scans must have been consumed.
 bool AppleMetalReconstruct(j_decompress_ptr cinfo, bool direct_output);

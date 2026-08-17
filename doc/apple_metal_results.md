@@ -125,6 +125,63 @@ also moved from 18.196 to 18.982 ms and CPU entropy from 11.535 to 12.792 ms.
 That cross-run delta is therefore not presented as an isolated GPU regression;
 the paired same-run result is the 25.9% latency reduction reported above.
 
+## GPU entropy bandwidth and rail energy
+
+The completed baseline entropy kernel was measured with five order-balanced
+OFF/AUTO pairs per path. Each sample decoded one image serially for at least
+1.5 seconds. The focused set used a 2.79 MP standard photo and a 3.15 MP
+high-texture image. CPU and GPU energy came from the system-wide macOS IOReport
+rail counters, with paired controls limiting run-order and background drift.
+JPEG MB/s and RGBA GB/s are effective decode-delivery rates, not
+memory-controller traffic.
+
+The table shows geometric means across the two images. `Selected` is the
+number that used GPU entropy; the other image remained an OFF/AUTO control.
+
+| JPEG | Output | Selected | Latency | RGBA bandwidth | CPU+GPU rail energy/image | CPU+GPU rail power | GFX DRAM bandwidth |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Q90 4:2:0 | Direct | 0/2 | +0.0% | -0.0% | -0.7% | -0.9% | -6.7% |
+| Q90 4:2:0 | CPU readback | 0/2 | -0.4% | +0.4% | -2.0% | -1.2% | -7.1% |
+| Q90 4:2:2 | Direct | 1/2 | -16.6% | +19.9% | +1.9% | +22.3% | -47.1% |
+| Q90 4:2:2 | CPU readback | 1/2 | -16.7% | +20.0% | +2.4% | +22.8% | -38.6% |
+| Q95 4:2:0 | Direct | 1/2 | -11.8% | +13.4% | +15.5% | +30.7% | -48.2% |
+| Q95 4:2:0 | CPU readback | 2/2 | -20.1% | +25.1% | +30.6% | +63.0% | -66.9% |
+| Q95 4:4:4 | Direct | 2/2 | -47.2% | +89.3% | -13.6% | +63.8% | -65.6% |
+| Q95 4:4:4 | CPU readback | 2/2 | -44.5% | +80.3% | -10.2% | +62.1% | -64.9% |
+| Q100 4:2:0 | Direct | 1/2 | -16.0% | +19.1% | +14.0% | +35.6% | -51.7% |
+| Q100 4:2:0 | CPU readback | 1/2 | -14.5% | +16.9% | +13.2% | +32.7% | -52.5% |
+
+Q95 4:4:4 is the joint latency and energy win. Direct output reduced latency
+by 47.2%, raised effective RGBA delivery by 89.3%, and used 13.6% less CPU+GPU
+rail energy per image. Average rail power rose 63.8% while the image was
+decoding; the energy saving came from finishing sooner. CPU readback was 44.5%
+faster and used 10.2% less rail energy. Q90 4:2:2 was close to energy-neutral.
+The selected Q95 4:2:0 and Q100 4:2:0 cases were faster but used more combined
+rail energy.
+
+Every AUTO-selected image showed lower GFX memory-controller bandwidth. The
+per-image median reduction was 59.3% to 76.2%. For Q95 4:4:4 direct output,
+the high-texture image moved from 10.33 to 3.55 GB/s and the standard photo
+from 8.22 to 2.83 GB/s. This is consistent with avoiding CPU-produced
+coefficient traffic before GPU reconstruction, but the counter measures the
+result, not its cause.
+
+AUTO now requires at least 1.5 MP, a fine luma quantization table, and 1.75 to
+5.5 entropy-coded bits per pixel. Direct 4:2:0 output uses a higher 3.0-bit
+lower bound. These checks keep Q90 4:2:0, sparse direct 4:2:0, and extremely
+dense Q100 high-texture input on CPU entropy. Progressive scans also remain on
+CPU; the broad progressive check selected GPU entropy in 0 of 20 path-image
+cases.
+
+The M4 Max exposes the old `AMC Stats` descriptions but refuses that
+subscription even as root. Its usable counters are under `PMP / DCS BW`.
+There, `AGX RD+WR` is a residency histogram with buckets from 1 through
+32 GB/s. The benchmark reports the residency-weighted mean and marks it as an
+estimate. The top bucket saturates, so absolute bandwidth can be understated;
+the paired direction and size of the changes were stable. These counters are
+system-wide and can include unrelated work. They were available without
+elevated privilege.
+
 ## Crossover and memory
 
 The deterministic crossover corpus resampled
@@ -166,25 +223,25 @@ times in the original three-decoder comparison was:
 
 Thus the original CPU JPEGli decoder did not beat TurboJPEG on latency.
 JPEGli's reconstruction differs perceptually because of adaptive
-dequantization. Mean scores over the 30 source images are below; higher
-SSIMULACRA2 and lower Butteraugli are better.
+dequantization. The expanded quality corpus covers Q25--100 in five-point
+steps, 4:4:4/4:2:2/4:2:0, and four full-reference metrics:
+SSIMULACRA2, Butteraugli, ColorVideoVDP, and DISTS. ImageIO output is explicitly
+rendered to sRGB.
 
-| Quality | Sampling | CPU JPEGli SSIM2 / BA | TurboJPEG SSIM2 / BA | ImageIO SSIM2 / BA |
-|---:|:---:|---:|---:|---:|
-| 50 | 4:2:0 | 60.171 / 4.692 | 60.631 / 4.670 | 59.895 / 5.308 |
-| 50 | 4:4:4 | 63.787 / 4.109 | 64.520 / 3.979 | 64.408 / 3.985 |
-| 75 | 4:2:0 | 71.984 / 3.508 | 71.774 / 3.478 | 70.788 / 4.463 |
-| 75 | 4:4:4 | 74.849 / 2.843 | 74.690 / 2.731 | 74.706 / 2.730 |
-| 90 | 4:2:0 | 81.996 / 2.671 | 81.295 / 2.650 | 79.726 / 3.813 |
-| 90 | 4:4:4 | 84.687 / 1.643 | 84.015 / 1.654 | 83.919 / 1.679 |
-| 95 | 4:2:0 | 86.673 / 2.318 | 86.027 / 2.343 | 83.923 / 3.603 |
-| 95 | 4:4:4 | 89.389 / 1.054 | 88.524 / 1.147 | 88.316 / 1.189 |
+There is still no universal winner. At Q90 and Q95, JPEGli leads three of four
+aggregate metrics for 4:4:4 and 4:2:2 against both incumbents; DISTS favors the
+incumbents. At Q100, JPEGli leads TurboJPEG on all four aggregate metrics in
+all three sampling modes. It leads ImageIO on all four at Q100 for 4:4:4 and
+4:2:2, while ImageIO retains the DISTS lead for 4:2:0. Strict per-image
+all-four wins at Q100 are 22/30, 13/30, and 6/30 against TurboJPEG and 23/30,
+17/30, and 1/30 against ImageIO for 4:4:4/4:2:2/4:2:0, so aggregate wins are
+not per-image guarantees.
 
-There is no universal quality winner at low quality: TurboJPEG leads several
-quality-50 and Butteraugli cases, while JPEGli generally leads SSIMULACRA2 at
-quality 75 and above and both metrics at high-quality 4:4:4. Every accelerated
-path is pixel-identical to CPU JPEGli and therefore has the same perceptual
-scores.
+The six log-ratio plots, formulas, raw 4,320-row corpus, aggregate tables,
+per-image win counts, version/weight hashes, and device-agreement check are in
+[perceptual_quality_results.md](perceptual_quality_results.md). Every
+accelerated path is pixel-identical to CPU JPEGli and therefore has the same
+four perceptual scores.
 
 The latency benchmark also records macOS `ri_energy_nj` around individual
 decodes, but that counter updates too coarsely for many sub-20-ms samples. A

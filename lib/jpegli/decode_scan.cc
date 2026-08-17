@@ -11,6 +11,7 @@
 #include <hwy/base.h>  // HWY_ALIGN_MAX
 
 #include "lib/base/status.h"
+#include "lib/jpegli/apple_metal_internal.h"
 #include "lib/jpegli/common.h"
 #include "lib/jpegli/common_internal.h"
 #include "lib/jpegli/decode_internal.h"
@@ -487,6 +488,18 @@ int ProcessScan(j_decompress_ptr cinfo, const uint8_t* const data,
     return kNeedMoreInput;
   }
   jpeg_decomp_master* m = cinfo->master;
+  if (m->apple_metal_entropy_skip_mode_) {
+    size_t consumed = 0;
+    if (!AppleMetalSkipEntropyScan(cinfo, data, len, &consumed)) {
+      JPEGLI_ERROR("Metal entropy plan does not match the input scan");
+    }
+    *pos = consumed;
+    *bit_pos = 0;
+    m->scan_mcu_row_ = cinfo->MCU_rows_in_scan;
+    m->scan_mcu_col_ = 0;
+    cinfo->input_iMCU_row = cinfo->total_iMCU_rows;
+    return JPEG_SCAN_COMPLETED;
+  }
   for (;;) {
     // Handle the restart intervals.
     if (cinfo->restart_interval > 0 && m->restarts_to_go_ == 0) {
